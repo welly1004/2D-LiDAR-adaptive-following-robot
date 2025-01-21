@@ -17,7 +17,10 @@ from nav_msgs.msg import Odometry
 import tf_transformations
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Bool
+from tf_transformations import quaternion_from_euler
+from geometry_msgs.msg import Point, Quaternion
 
+import math
 class LegDetectionNode(Node):
     def __init__(self):
         super().__init__('leg_detection')
@@ -29,6 +32,7 @@ class LegDetectionNode(Node):
         self.marker_publisher = self.create_publisher(Marker, '/leg_center', 10) 
         self.arrow_publisher = self.create_publisher(Marker, '/robot_to_leg_vector', 10) 
         self.front_arrow_publisher = self.create_publisher(Marker, '/robot_front_vector', 10) 
+        self.Mr_Chou_publisher = self.create_publisher(Marker, '/Mr_Chou', 10) 
         self.distance_publisher = self.create_publisher(Marker, '/robot_to_leg_distance', 10) 
         self.cluster_marker_publisher = self.create_publisher(Marker, '/leg_marker', 10)
         self.go_back_publisher = self.create_publisher(Bool, '/go_back', 10)
@@ -70,20 +74,7 @@ class LegDetectionNode(Node):
         # plt.ylabel('Distance (m)')
         # plt.title('Real-time Distance to Leg')
         # plt.ion()  # Enable interactive mode
-    def publish_start_end(self):
-        if len(self.robot_trajectory.poses) >= 2:
-            start_pose = self.robot_trajectory.poses[0].pose
-            end_pose = self.robot_trajectory.poses[-1].pose
-
-            # Log or print the start and end pose
-            self.get_logger().info(f"START: {start_pose}")
-            self.get_logger().info(f"END: {end_pose}")
-
-            # Publish the start and end pose as needed
-            # You could create a custom message or a standard message
-            start_end_msg = Bool()
-            start_end_msg.data = True  # This is just an example. Customize as needed.
-            self.start_end_publisher.publish(start_end_msg)
+ 
     
         self.start_pose_published = False
     def odom_callback(self, msg):
@@ -97,7 +88,7 @@ class LegDetectionNode(Node):
                 start_pose.header = msg.header
                 start_pose.pose = self.current_robot_pose
                 self.start_position_publisher.publish(start_pose)
-
+                # self.get_logger().info(f"{start_pose}")
                 # 設置標誌為 True，表示已經發布過一次
                 self.start_pose_published = True
             
@@ -167,7 +158,10 @@ class LegDetectionNode(Node):
             self.clear_arrows(msg.header.frame_id)
             self.clear_distance(msg.header.frame_id)
             self.clear_cluster(msg.header.frame_id)
+            self.clear_path()
+            self.clear_robot_trajectory()
         self.publish_front_arrow(msg.header.frame_id)
+        self.publish_Mr_Chou(msg.header.frame_id)
 
         if hasattr(self, 'target_detected') and self.target_detected:
             if self.target_detected:
@@ -212,7 +206,7 @@ class LegDetectionNode(Node):
 
         clustering_successful = False
         if len(self.points) > 0:
-            clustering = DBSCAN(eps=0.1, min_samples=3).fit(self.points)
+            clustering = DBSCAN(eps=0.1, min_samples=30).fit(self.points)
             clustering_successful = True
 
         leg_points = []
@@ -316,8 +310,8 @@ class LegDetectionNode(Node):
             arrow_text_marker.pose.position.y = center_of_cluster[1] + 0.2
             arrow_text_marker.pose.position.z = 0.0
             arrow_text_marker.pose.orientation.w = 1.0
-            arrow_text_marker.scale.x = 0.02
-            arrow_text_marker.scale.y = 0.05
+            arrow_text_marker.scale.x = 1.62
+            arrow_text_marker.scale.y = 1.25
             arrow_text_marker.scale.z = 0.06
             arrow_text_marker.color.a = 1.0
             arrow_text_marker.color.r = 1.0
@@ -371,8 +365,45 @@ class LegDetectionNode(Node):
     def spin(self):
         rclpy.spin(self)
         plt.show()
+    def publish_Mr_Chou(self, frame_id):
+        model_marker = Marker()
+        model_marker.header.frame_id = frame_id
+        model_marker.header.stamp = self.get_clock().now().to_msg()
+        model_marker.type = Marker.MESH_RESOURCE
+        model_marker.action = Marker.ADD
 
+        # 指定模型文件的路徑（此範例使用 .dae 檔案）
+        model_marker.mesh_resource = "file:///home/airlab/Downloads/meshes/robot.dae"
+
+        # 設置模型的比例（可根據需要調整）
+        model_marker.scale.x = 0.00057
+        model_marker.scale.y = 0.00057
+        model_marker.scale.z = 0.00057
+
+        # model_marker.pose.position.x=-0.4
+        model_marker.pose.position = Point(x=0.2422, y=-0.254, z=-0.07)
+
+        # 計算四元數以沿著 X 軸旋轉 90 度
+        roll = math.radians(90)  # 90 度的旋轉
+        pitch = 0
+        yaw = 0
+        q = quaternion_from_euler(roll, pitch, yaw)
+        model_marker.pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+
+        # 設置模型的顏色（如果模型本身沒有顏色或需要覆蓋）
+        model_marker.color.r = 0.66
+        model_marker.color.g = 0.66
+        model_marker.color.b = 0.66
+        model_marker.color.a = 0.8  # 完全不透明
+
+    # 發布模型
+        # 發布模型
+        self.Mr_Chou_publisher.publish(model_marker)
+
+        
+        
     def publish_front_arrow(self, frame_id):
+        
         arrow_marker = Marker()
         arrow_marker.header.frame_id = frame_id
         arrow_marker.header.stamp = self.get_clock().now().to_msg()
@@ -426,11 +457,46 @@ class LegDetectionNode(Node):
         arrow_marker.action = Marker.DELETE
         self.distance_publisher.publish(arrow_marker)
 
+    def clear_path(self):
+    # 創建一個空的 Path 訊息，與之前發布的路徑保持一致
+        empty_path_msg = Path()
+        empty_path_msg.header.frame_id = 'odom'
+        empty_path_msg.header.stamp = self.get_clock().now().to_msg()
+
+        # 清空之前存儲的路徑數據
+        self.path_msg.poses.clear()
+
+        # 發布空的 Path 訊息，來清除顯示中的路徑
+        self.path_pub.publish(empty_path_msg)
+        # self.get_logger().info("Path cleared successfully")
+
+    def clear_robot_trajectory(self):
+    # 創建一個空的 Path 訊息來清除 RViz 中的顯示
+        empty_trajectory = Path()
+        empty_trajectory.header.frame_id = 'odom'
+        empty_trajectory.header.stamp = self.get_clock().now().to_msg()
+
+        # 清空儲存的機器人路徑數據
+        self.robot_trajectory.poses.clear()
+
+        # 發布這個空的路徑訊息來清除顯示
+        self.robot_trajectory_publisher.publish(empty_trajectory)
+        
+        # self.get_logger().info("Robot trajectory cleared.")
+
+        # 重置 self.robot_trajectory 以開始新的路徑記錄
+        self.robot_trajectory = Path()
+        self.robot_trajectory.header.frame_id = 'odom'
+    
+
     def clear_all_markers(self, frame_id):
         self.clear_markers(frame_id)
         self.clear_arrows(frame_id)
         self.clear_distance(frame_id)
         self.clear_cluster(frame_id)
+        self.clear_path()
+        self.clear_robot_trajectory()
+
 
     # def destroy_node(self):
     #     self.clear_all_markers('base_link')  # 清除所有標記
