@@ -1,132 +1,133 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Vector3
 from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Twist
+import matplotlib.pyplot as plt
+import time
 import math
 
-class PIDController:
-    def __init__(self, kp, ki, kd):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.error_sum = 0.0
-        self.preve_rror = 0.0
-    
-    def update(self, error):
-        output = self.kp * error + self.ki * self.error_sum + self.kd * (error - self.preve_rror)
 
-        self.error_sum += error
-        self.preve_rror = error
-
-        return output
-    
-class HumanFollowingNode(Node):
+class DistancePlotter(Node):
     def __init__(self):
-        super().__init__('human_following')
-        # self.subscription = self.create_subscription(
-        #     Marker,
-        #     '/vector_distance',
-        #     self.vector_distance_callback,
-        #     10)
-        
+        super().__init__('distance_plotter')
+
+        # 訂閱主題
+        self.center_subscription = self.create_subscription(
+            Marker,
+            '/leg_center',
+            self.leg_center_callback,
+            10
+        )
         self.angle_subscriber = self.create_subscription(
             Marker,
             '/robot_to_leg_vector',
             self.vector_arrows_callback,
-            10)
-        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+            10
+        )
+        self.position_subscriber = self.create_subscription(
+            Marker,
+            '/robot_to_following_position_vector',
+            self.following_pos_callback,
+            10
+        )
 
-        self.distance = 0.0
-        self.angle_degrees = 0.0
+        # 初始化變數
+        self.start_time = time.time()  # 程式啟動的時間
+        self.times = []  # 紀錄時間的列表
+        self.distances_to_leg_center = []  # 到 /leg_center 的距離
+        self.angle_distances = []  # 角度變化數據
+        self.following_pos = []  # 到 /robot_to_following_position_vector 的距離
+        self.angle_degrees = 0  # 當前計算的角度（以度為單位）
+        self.distance_to_following_pos = 0.0  # 當前計算的距離
 
-        self.distance_controller = PIDController(kp=1.0, ki=0.0, kd=0.1)
-        self.angle_controller = PIDController(kp=0.05, ki=0.0, kd=0.1)
+        # 創建圖表
+        self.figure, (self.ax1, self.ax2, self.ax3) = plt.subplots(3, 1, figsize=(10, 9))  # 設置更大的窗口大小
+        self.figure.tight_layout(pad=3.0)  # 設置子圖間距
+        plt.ion()  # 啟用互動模式，便於即時更新圖表
 
-    # def vector_distance_callback(self, msg):
-    #     if msg.text:
-    #         try: 
-    #             self.distance = float(msg.text[:-1])     
-    #             self.get_logger().info("Received distance value: %s" % self.distance)
+    def following_pos_callback(self, msg):
+        # 檢查接收到的點是否足夠
+        if len(msg.points) < 2:
+            self.get_logger().warn("not receive /robot_to_following_position_vector message")
+            return
 
-    #             control_output = self.distance_controller.update(self.distance-0.4)
-
-    #             self.get_logger().info("Distance control output: %s" % control_output)
-                
-    #             twist_msg = Twist()
-    #             twist_msg.linear.x = control_output  # Set linear velocity
-    #             twist_msg.angular.z = 0.0  # Set angular velocity
-    #             # self.cmd_vel_publisher.publish(twist_msg)
-
-    #         # Publish Twist message
-                
-
-    #         except ValueError:
-    #             self.get_logger().error("Invalid distance value: %s" % msg.text)
-    #     else:
-    #         self.get_logger().warn("Empty arrows message received")
-        # self.publish_distance_and_angle()
-    
-    
+        # 計算到目標點的距離
+        x, y = msg.points[1].x, msg.points[1].y
+        self.distance_to_following_pos = math.sqrt(x**2 + y**2)  
 
     def vector_arrows_callback(self, msg):
-        if len(msg.points) >= 2:
-            try:
-                self.second_point = msg.points[1]
-                x = round(self.second_point.x, 2)
-                y = round(self.second_point.y, 2)
-                print("Target coordinates (x, y):", x, y)
-                
-                magnitude_a = math.sqrt(x ** 2 + y ** 2)
-                magnitude_b = math.sqrt(0 ** 2 + 1 ** 2)
+        # 檢查接收到的點是否足夠
+        if len(msg.points) < 2:
+            self.get_logger().warn("not receive /robot_to_leg_vector message")
+            return
 
-                magnitude_a = round(magnitude_a, 2)
-                self.get_logger().info(f"Received distance value: {magnitude_a}"  )
-                
-                self.distance=magnitude_a-0.5
-                control_output_DS = self.distance_controller.update(self.distance)       
+        # 提取第二個點並計算角度
+        x, y = msg.points[1].x, msg.points[1].y
+        magnitude_a = math.sqrt(x ** 2 + y ** 2)
+        magnitude_b = math.sqrt(0 ** 2 + 1 ** 2)
+        if magnitude_a !=0 :
 
-                if magnitude_a !=0 :
+            dot_product = x * 0 + y * -1
 
-                    dot_product = x * 0 + y * -1
+            angle_radians = math.acos(dot_product / (magnitude_a * magnitude_b))
 
-                    angle_radians = math.acos(dot_product / (magnitude_a * magnitude_b))
+            self.angle_degrees = math.degrees(angle_radians)
+            self.angle_degrees = round(self.angle_degrees, 2)
+            
+            self.get_logger().info(f"Angle between the target point and the robot : {self.angle_degrees}")
+            if x<0:
+                self.angle_degrees*=-1
 
-                    self.angle_degrees = math.degrees(angle_radians)
-                    self.angle_degrees = round(self.angle_degrees, 2)
-                    
-                    self.get_logger().info(f"Angle between the target point and the robot : {self.angle_degrees}")
-                    if x<0:
-                        self.angle_degrees*=-1
+    def leg_center_callback(self, msg):
+        # 檢查接收到的點是否足夠
+        if len(msg.points) == 0:
+            self.get_logger().warn("not receive /leg_center message")
+            return
 
-                    control_output_AG = self.angle_controller.update(self.angle_degrees)
+        # 計算到 /leg_center` 的距離
+        x, y = msg.points[0].x, msg.points[0].y
+        distance_to_leg_center = math.sqrt(x**2 + y**2)  
 
-                    self.get_logger().info(f"Distance PID_Control output: {control_output_DS}")
-                    self.get_logger().info(f'''Angle PID_Control output: {control_output_AG}''')
+        # 紀錄時間和距離數據
+        elapsed_time = time.time() - self.start_time
+        self.times.append(elapsed_time)  # 紀錄經過的時間
+        self.distances_to_leg_center.append(distance_to_leg_center)  # 紀錄距離
+        self.angle_distances.append(self.angle_degrees)  # 紀錄角度
+        self.following_pos.append(self.distance_to_following_pos)  # 紀錄到目標點的距離
 
+        # 更新圖表
+        self.ax1.clear()
+        self.ax1.plot(self.times, self.distances_to_leg_center, label='Distance to leg',color='blue')
+        self.ax1.set_xlabel('Time(s)')
+        self.ax1.set_ylabel('Distance(m)')
+        self.ax1.set_title('Robot to leg distance.')
+        self.ax1.legend()
 
-                    twist_msg= Twist()
-                    twist_msg.linear.x = control_output_DS  # Set linear velocity
-                    twist_msg.angular.z = control_output_AG  # Set angular velocity left is + right is -
+        self.ax2.clear()
+        self.ax2.plot(self.times, self.angle_distances, label='Degree to leg', color='orange')
+        self.ax2.set_xlabel('Time(s)')
+        self.ax2.set_ylabel('Angle(Degree)')
+        self.ax2.set_title('Robot to leg angle.')
+        self.ax2.legend()
 
-                    # Publish Twist message
-                    self.cmd_vel_publisher.publish(twist_msg)
-                    
-            except IndexError:
-                self.get_logger().error("Failed to access second point in the message")
-                x = 0  
-                y = 0  
+        self.ax3.clear()
+        self.ax3.plot(self.times, self.following_pos, label='Distance to following position', color='green')
+        self.ax3.set_xlabel('Time(s)')
+        self.ax3.set_ylabel('Distance(m)')
+        self.ax3.set_title('Robot to following position distance.')
+        self.ax3.legend()
 
-  
+        plt.draw()
+        plt.pause(0.01)  # 短暫暫停以更新圖表
 
-    
 
 def main(args=None):
     rclpy.init(args=args)
-    human_following_node = HumanFollowingNode()
-    rclpy.spin(human_following_node)
-    human_following_node.destroy_node()
-    rclpy.shutdown()
+    node = DistancePlotter()  
+    rclpy.spin(node)  
+    plt.ioff()  
+    plt.show()  
+
 
 if __name__ == '__main__':
     main()
+
