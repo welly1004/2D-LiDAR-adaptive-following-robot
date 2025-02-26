@@ -1,250 +1,219 @@
 import rclpy
 from rclpy.node import Node
 from visualization_msgs.msg import Marker
+from geometry_msgs.msg import Point
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Point, PoseStamped, Twist
 from std_msgs.msg import ColorRGBA
-from nav_msgs.msg import Path
 import math
-from tf2_ros import TransformListener, Buffer
-from rclpy.duration import Duration
-from nav_msgs.msg import Odometry
+from collections import deque
 
 class FollowingPositionNode(Node):
     def __init__(self):
         super().__init__('following_position')
         self.subscription = self.create_subscription(
-            Marker,
-            'leg_center',
-            self.leg_center_callback,
-            10)
+            Marker, 'leg_center', self.leg_center_callback, 10)
+        self.scan_subscription = self.create_subscription(
+            LaserScan, 'scan', self.scan_callback, 10)
         
-        self.publisher = self.create_publisher(Marker, 'following_pos_marker', 10)  
-        self.arrow_publisher = self.create_publisher(Marker, '/robot_to_following_position_vector', 10) 
-       
-        self.lidar_subscription = self.create_subscription(
-            LaserScan,
-            '/scan',  
-            self.lidar_callback,
-            10)
+        # 添加箭頭的發布者
+        self.publisher = self.create_publisher(Marker, 'following_pos_marker', 10)
+        self.arrow_publisher = self.create_publisher(Marker, 'robot_to_following_position_vector', 10)
         
-        self.odom_subscription = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            qos_profile=rclpy.qos.qos_profile_sensor_data)
-
-        self.goal_publisher = self.create_publisher(PoseStamped, '/goal_pose', 10)
-        self.lidar_data = []  
-        self.current_goal = Point()
-        self.leg_center_position = None  # Store the leg center position
-    
-        self.circle_radius_x = 0.5 
-        self.circle_radius_y = 0.8  
-        self.distance_threshold = 0.35  # 判定距離值
-
-        # 評分權重
-        self.w1 = 1.0  # 機器人距離權重
-        self.w2 = 1.0  # 障礙物距離權重
-        self.w3 = 10.0  # 腿部中心距離權重
-
-    def odom_callback(self, msg):
-        self.current_robot_pose = msg.pose.pose
-        self.current_goal_pose = self.current_goal
-
-        rounded_robot_x = round(self.current_robot_pose.position.x, 1)
-        rounded_robot_y = round(self.current_robot_pose.position.y, 1)
-       
-        rounded_target_x = round(self.current_goal_pose.x, 1)
-        rounded_target_y = round(self.current_goal_pose.y, 1)
+        self.circle_radius_x = 0.8
+        self.circle_radius_y = 0.5  
+        self.leg_positions = deque(maxlen=5)
+        self.current_theta = 0.0
+        self.movement_threshold = 0.1
         
-        # print(rounded_robot_x,rounded_target_x)
-        # print(rounded_robot_y,rounded_target_y)
-
-        if (rounded_robot_x == rounded_target_x) and (rounded_robot_y == rounded_target_y):
-            print("odom match goal_pose")
-            goal_pose = PoseStamped()
-            goal_pose.header.frame_id = "rplidar_link"  
-            goal_pose.header.stamp = self.get_clock().now().to_msg()  
-
-            goal_pose.pose.position.x = 0.0
-            goal_pose.pose.position.y = 0.0
-            goal_pose.pose.position.z = 0.0
-
-            goal_pose.pose.orientation.w = 1.0
-            goal_pose.pose.orientation.x = 0.0
-            goal_pose.pose.orientation.y = 0.0
-            goal_pose.pose.orientation.z = 0.0
-
-            self.goal_publisher.publish(goal_pose)
-
-    def leg_center_callback(self, msg):
-        if msg.points:
-            # Store the first leg center point
-            self.leg_center_position = msg.points[0]
-            for i, point in enumerate(msg.points):
-                self.publish_circle_marker(point.x, point.y, i)  
-        else:
-            self.get_logger().info('No points received in the leg_center message.')
-            self.leg_center_position = None
-
-    def publish_goal_pose(self, point):
-        self.current_goal = point 
-        goal_pose = PoseStamped()
-        goal_pose.header.frame_id = "rplidar_link"
-        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        self.alpha = 1.0
+        self.beta = 1.0
+        self.gamma = 5.0
+        # self.max_obs_dist = 2.0
         
-        goal_pose.pose.position = point
-        goal_pose.pose.orientation.x = 0.0
-        goal_pose.pose.orientation.y = 0.0
-        goal_pose.pose.orientation.z = -0.707  # 90度旋轉
-        goal_pose.pose.orientation.w = 0.707  # 對應90度
+        self.robot_pos = (0.0, 0.0)
+        self.obstacles = []
 
-    def lidar_callback(self, scan_data):
-        # 將LiDAR數據轉換為二維點 (x, y)
-        self.lidar_data = []
-        angle_min = scan_data.angle_min
-        angle_increment = scan_data.angle_increment
+    def calculate_detailed_score(self, x, y):
+        # 計算各個分項分數
+        d_robot = math.sqrt((x - self.robot_pos[0])**2 + (y - self.robot_pos[1])**2)
+        robot_score = -self.alpha * d_robot
+        
+        d_obstacle = float('inf')
+        for obs in self.obstacles:
+            dist = math.sqrt((x - obs[0])**2 + (y - obs[1])**2)
+            d_obstacle = min(d_obstacle, dist)
+        # d_obstacle = min(d_obstacle, self.max_obs_dist)
+        obstacle_score = self.beta * d_obstacle
+        
+        leg_score = 0
+        if self.leg_positions:
+            leg_x, leg_y = self.leg_positions[-1]
+            d_leg = math.sqrt((x - leg_x)**2 + (y - leg_y)**2)
+            leg_score = -self.gamma * d_leg
+        
+        total_score = robot_score + obstacle_score + leg_score
+        return robot_score, obstacle_score, leg_score, total_score
 
-        for i, range_value in enumerate(scan_data.ranges):
-            if math.isinf(range_value):
-                continue  # 忽略無窮大數據（表示沒有檢測到障礙）
-            angle = angle_min + i * angle_increment
-            x = range_value * math.cos(angle)
-            y = range_value * math.sin(angle)
-            self.lidar_data.append((x, y))
-
-    def publish_circle_marker(self, center_x, center_y, marker_id):
+    def publish_arrow(self, start_point, best_point):
         marker = Marker()
         marker.header.frame_id = "rplidar_link"
         marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "circle"
-        marker.id = marker_id
+        marker.ns = "best_direction"
+        marker.id = 0
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+        
+        # 設置箭頭起點和終點
+        marker.points = []
+        start = Point()
+        start.x = start_point[0]
+        start.y = start_point[1]
+        start.z = 0.0
+        marker.points.append(start)
+        
+        end = Point()
+        end.x = best_point[0]
+        end.y = best_point[1]
+        end.z = 0.0
+        marker.points.append(end)
+        
+        # 設置箭頭的大小
+        marker.scale.x = 0.02  # 箭桿寬度
+        marker.scale.y = 0.04   # 箭頭寬度
+        marker.scale.z = 0.0   # 箭頭長度
+        
+        # 設置箭頭顏色（紅色）
+        marker.color.r = 1.0
+        marker.color.g = 1.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+        
+        self.arrow_publisher.publish(marker)
+
+    def publish_ellipse(self, center_x, center_y, theta):
+        marker = Marker()
+        marker.header.frame_id = "rplidar_link"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "ellipse"
+        marker.id = 0
         marker.type = Marker.SPHERE_LIST
         marker.action = Marker.ADD
-
         marker.pose.orientation.w = 1.0
-        marker.scale.x = 0.05  
+        marker.scale.x = 0.05
         marker.scale.y = 0.05
         marker.scale.z = 0.05
-
-        marker.colors = []
-        marker.points = []
-
-        max_score = float('-inf')
-        min_score = float('inf')
-        highest_score_point = None  
-
-        # 生成圓形點並進行處理
-        for circle_point in self.generate_circle_points(center_x, center_y, self.circle_radius_x, self.circle_radius_y):
-            distance_to_robot = math.sqrt(circle_point.x**2 + circle_point.y**2)
-            distance_to_obstacle = self.closest_obstacle_distance(circle_point.x, circle_point.y)
-
-            # Calculate distance to leg center if available
-            leg_center_score = 0
-            if self.leg_center_position:
-                distance_to_leg = math.sqrt(
-                    (circle_point.x - self.leg_center_position.x)**2 + 
-                    (circle_point.y - self.leg_center_position.y)**2
-                )
-                leg_center_score = 1.0 / (distance_to_leg + 1e-5)  # Closer to leg center = higher score
-
-            # Combined weighted score calculation
-            score = (
-                self.w1 * (1.0 / (distance_to_robot + 1e-5)) - 
-                self.w2 * (1.0 / (distance_to_obstacle + 1e-5)) + 
-                self.w3 * leg_center_score
-            )
-
-            if score > max_score:
-                max_score = score
-                highest_score_point = circle_point
-            if score < min_score:
-                min_score = score
-
-            marker.points.append(circle_point)
-
-        # 根據分數設定顏色
-        for circle_point in marker.points:
-            distance_to_robot = math.sqrt(circle_point.x**2 + circle_point.y**2)
-            distance_to_obstacle = self.closest_obstacle_distance(circle_point.x, circle_point.y)
+        
+        points_and_scores = self.generate_ellipse_points_with_scores(center_x, center_y, theta)
+        
+        # 找出最高分數的點
+        best_point = None
+        best_score = float('-inf')
+        scores = []
+        
+        # 輸出所有點的分數
+        self.get_logger().info("\n=== Points Scores ===")
+        
+        for i, (point, score_tuple) in enumerate(points_and_scores):
+            robot_score, obstacle_score, leg_score, total_score = score_tuple
+            scores.append(total_score)
             
-            leg_center_score = 0
-            if self.leg_center_position:
-                distance_to_leg = math.sqrt(
-                    (circle_point.x - self.leg_center_position.x)**2 + 
-                    (circle_point.y - self.leg_center_position.y)**2
-                )
-                leg_center_score = 1.0 / (distance_to_leg + 1e-5)
-
-            score = (
-                self.w1 * (1.0 / (distance_to_robot + 1e-5)) - 
-                self.w2 * (1.0 / (distance_to_obstacle + 1e-5)) + 
-                self.w3 * leg_center_score
-            )
-            normalized_score = (score - min_score) / (max_score - min_score)
-
+            # 輸出每個點的詳細分數
+            self.get_logger().info(f"Point {i}: Robot Score: {robot_score:.2f}, "
+                                 f"Obstacle Score: {obstacle_score:.2f}, "
+                                 f"Leg Score: {leg_score:.2f}, "
+                                 f"Total Score: {total_score:.2f}")
+            
+            if total_score > best_score:
+                best_score = total_score
+                best_point = (point.x, point.y)
+        
+        min_score = min(scores)
+        max_score = max(scores)
+        
+        # 發布指向最佳點的箭頭
+        if best_point:
+            self.publish_arrow((0.0, 0.0), best_point)
+        
+        marker.points = []
+        marker.colors = []
+        for point, score_tuple in points_and_scores:
+            marker.points.append(point)
+            
             color = ColorRGBA()
-            color.r = normalized_score
-            color.g = normalized_score
-            color.b = normalized_score
+            r, g, b = self.get_color_from_score(score_tuple[3], min_score, max_score)
+            color.r = float(r)
+            color.g = float(g)
+            color.b = float(b)
             color.a = 1.0
-
             marker.colors.append(color)
-
+        
         self.publisher.publish(marker)
 
-        if highest_score_point:
-            self.publish_goal_pose(highest_score_point)
-            self.publish_vector_arrows("rplidar_link", [(highest_score_point.x, highest_score_point.y)])
-    
-    def closest_obstacle_distance(self, x, y):
-        closest_distance = float('inf')
-        for lidar_point in self.lidar_data:
-            distance = math.sqrt((lidar_point[0] - x)**2 + (lidar_point[1] - y)**2)
-            if distance < closest_distance:
-                closest_distance = distance
-        return closest_distance
-
-    def publish_vector_arrows(self, frame_id, position_point):
-        for i, following_position in enumerate(position_point):
-            arrow_marker = Marker()
-            arrow_marker.header.frame_id = frame_id
-            arrow_marker.header.stamp = self.get_clock().now().to_msg()
-            arrow_marker.type = Marker.ARROW
-            arrow_marker.action = Marker.ADD
-            
-            # 箭頭起點在機器人位置 (0,0)
-            arrow_marker.points.append(Point(x=0.0, y=0.0, z=0.0))
-            
-            # 箭頭終點指向藍色點位置
-            arrow_marker.points.append(Point(x=self.current_goal.x, y=self.current_goal.y, z=0.0))
-            
-            arrow_marker.scale.x = 0.02
-            arrow_marker.scale.y = 0.04
-            arrow_marker.scale.z = 0.0
-
-            arrow_marker.color.a = 1.0
-            arrow_marker.color.r = 1.0
-            arrow_marker.color.g = 1.0
-            arrow_marker.color.b = 1.0  # 白色箭頭
-
-            # 發佈箭頭
-            self.arrow_publisher.publish(arrow_marker)
-
-    def generate_circle_points(self, center_x, center_y, radius_x, radius_y):
-        points = []
-        num_points = 100  # 圓由 num_points 個點構成
-        for i in range(num_points):  
+    def generate_ellipse_points_with_scores(self, center_x, center_y, theta):
+        points_and_scores = []
+        num_points = 100
+        cos_theta = math.cos(theta)
+        sin_theta = math.sin(theta)
+        
+        for i in range(num_points):
             angle = 2 * math.pi * i / num_points
-            x = center_x + radius_x * math.cos(angle)
-            y = center_y + radius_y * math.sin(angle)
+            x = self.circle_radius_x * math.cos(angle)
+            y = self.circle_radius_y * math.sin(angle)
+            
+            x_rot = x * cos_theta - y * sin_theta
+            y_rot = x * sin_theta + y * cos_theta
+            
+            final_x = center_x + x_rot
+            final_y = center_y + y_rot
+            
             point = Point()
-            point.x = x
-            point.y = y
+            point.x = final_x
+            point.y = final_y
             point.z = 0.0
-            points.append(point)
-        return points
+            
+            # 獲取詳細分數
+            scores = self.calculate_detailed_score(final_x, final_y)
+            
+            points_and_scores.append((point, scores))
+            
+        return points_and_scores
+
+
+    def scan_callback(self, msg):
+        self.obstacles = []
+        angle = msg.angle_min
+        for distance in msg.ranges:
+            if msg.range_min <= distance <= msg.range_max:
+                x = distance * math.cos(angle)
+                y = distance * math.sin(angle)
+                self.obstacles.append((x, y))
+            angle += msg.angle_increment
+
+    def get_color_from_score(self, score, min_score, max_score):
+        if max_score == min_score:
+            normalized = 0.5
+        else:
+            normalized = (score - min_score) / (max_score - min_score)
+        return normalized, normalized, normalized
+
+    def leg_center_callback(self, msg):
+        if msg.points:
+            self.leg_positions.append((msg.points[0].x, msg.points[0].y))
+            new_theta = self.calculate_movement_direction()
+            if new_theta is not None:
+                self.current_theta = new_theta
+            self.publish_ellipse(msg.points[0].x, msg.points[0].y, self.current_theta)
+
+    def calculate_movement_direction(self):
+        if len(self.leg_positions) < 2:
+            return None
+        x_old, y_old = self.leg_positions[0]
+        x_new, y_new = self.leg_positions[-1]
+        distance = math.sqrt((x_new - x_old)**2 + (y_new - y_old)**2)
+        if distance < self.movement_threshold:
+            return None
+        vx, vy = x_new - x_old, y_new - y_old
+        return math.atan2(vy, vx)
 
 def main(args=None):
     rclpy.init(args=args)
