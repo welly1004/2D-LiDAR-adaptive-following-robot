@@ -23,12 +23,12 @@ class FollowingPositionNode(Node):
         self.circle_radius_y = 0.5  
         self.leg_positions = deque(maxlen=5)
         self.current_theta = 0.0
-        self.movement_threshold = 0.1
+        self.movement_threshold = 0.25
         
         self.alpha = 1.0
         self.beta = 1.0
         self.gamma = 5.0
-        # self.max_obs_dist = 2.0
+        self.max_obs_dist = 2.0
         
         self.robot_pos = (0.0, 0.0)
         self.obstacles = []
@@ -38,12 +38,16 @@ class FollowingPositionNode(Node):
         d_robot = math.sqrt((x - self.robot_pos[0])**2 + (y - self.robot_pos[1])**2)
         robot_score = -self.alpha * d_robot
         
+        # 修改障礙物分數計算
         d_obstacle = float('inf')
         for obs in self.obstacles:
             dist = math.sqrt((x - obs[0])**2 + (y - obs[1])**2)
             d_obstacle = min(d_obstacle, dist)
-        # d_obstacle = min(d_obstacle, self.max_obs_dist)
-        obstacle_score = self.beta * d_obstacle
+
+        # 使用反比關係計算分數：距離越小，分數越低（更負）
+        # 添加一個小常數避免除以零的問題
+        epsilon = 0.05  # 小常數，避免分母為零
+        obstacle_score = -self.beta / (d_obstacle + epsilon)
         
         leg_score = 0
         if self.leg_positions:
@@ -178,7 +182,7 @@ class FollowingPositionNode(Node):
             
         return points_and_scores
 
-
+    
     def scan_callback(self, msg):
         self.obstacles = []
         angle = msg.angle_min
