@@ -261,7 +261,8 @@ class DWAPathPlanner(Node):
         if self.target_point is not None:
             if self.best_path_velocity[0] < 0.15:
                 twist_msg.linear.x =   self.best_path_velocity[0]
-                twist_msg.angular.z =  0.0 # Set angular velocity left is + right is -        
+                twist_msg.angular.z =  0.0
+                # twist_msg.angular.z =  0.0 # Set angular velocity left is + right is -        
             else:
                 twist_msg.linear.x =   self.best_path_velocity[0]
                 twist_msg.angular.z =  self.best_path_velocity[1] # Set angular velocity left is + right is -
