@@ -1,11 +1,14 @@
 import rclpy
 from rclpy.node import Node
 from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PointStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import ColorRGBA
 import math
 from collections import deque
+import tf2_ros
+import tf2_geometry_msgs
+from tf2_ros import TransformException
 
 class FollowingPositionNode(Node):
     def __init__(self):
@@ -19,19 +22,53 @@ class FollowingPositionNode(Node):
         self.publisher = self.create_publisher(Marker, 'following_pos_marker', 10)
         self.arrow_publisher = self.create_publisher(Marker, 'robot_to_following_position_vector', 10)
         
+        # 初始化TF2緩衝區和監聽器
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        
         self.circle_radius_x = 0.8
         self.circle_radius_y = 0.5  
-        self.leg_positions = deque(maxlen=5)
+        self.leg_positions = deque(maxlen=5)      # 相對座標下的腿部位置
+        self.global_leg_positions = deque(maxlen=5)  # 全局座標下的腿部位置
         self.current_theta = 0.0
-        self.movement_threshold = 0.25
+        self.movement_threshold = 0.2
         
         self.alpha = 1.0
         self.beta = 1.0
-        self.gamma = 5.0
+        self.gamma = 8.0
         self.max_obs_dist = 2.0
         
         self.robot_pos = (0.0, 0.0)
         self.obstacles = []
+        
+        # 設置坐標系（使用odom作為全局參考系）
+        self.global_frame = "odom"
+        self.robot_frame = "rplidar_link"
+
+    def transform_to_global_frame(self, x, y):
+        """將相對座標轉換為odom坐標系下的坐標"""
+        try:
+            # 創建帶時間戳的點
+            point_stamped = PointStamped()
+            point_stamped.header.frame_id = self.robot_frame
+            point_stamped.header.stamp = self.get_clock().now().to_msg()
+            point_stamped.point.x = x
+            point_stamped.point.y = y
+            point_stamped.point.z = 0.0
+            
+            # 執行轉換
+            transform = self.tf_buffer.lookup_transform(
+                self.global_frame,
+                self.robot_frame,
+                rclpy.time.Time())
+                
+            # 轉換點
+            global_point = tf2_geometry_msgs.do_transform_point(point_stamped, transform)
+            
+            return (global_point.point.x, global_point.point.y)
+        except TransformException as ex:
+            self.get_logger().warning(f"無法轉換座標: {ex}")
+            return None
 
     def calculate_detailed_score(self, x, y):
         # 計算各個分項分數
@@ -60,7 +97,7 @@ class FollowingPositionNode(Node):
 
     def publish_arrow(self, start_point, best_point):
         marker = Marker()
-        marker.header.frame_id = "rplidar_link"
+        marker.header.frame_id = self.robot_frame
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "best_direction"
         marker.id = 0
@@ -86,7 +123,7 @@ class FollowingPositionNode(Node):
         marker.scale.y = 0.04   # 箭頭寬度
         marker.scale.z = 0.0   # 箭頭長度
         
-        # 設置箭頭顏色（紅色）
+        # 設置箭頭顏色（白色）
         marker.color.r = 1.0
         marker.color.g = 1.0
         marker.color.b = 1.0
@@ -96,7 +133,7 @@ class FollowingPositionNode(Node):
 
     def publish_ellipse(self, center_x, center_y, theta):
         marker = Marker()
-        marker.header.frame_id = "rplidar_link"
+        marker.header.frame_id = self.robot_frame
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "ellipse"
         marker.id = 0
@@ -182,7 +219,6 @@ class FollowingPositionNode(Node):
             
         return points_and_scores
 
-    
     def scan_callback(self, msg):
         self.obstacles = []
         angle = msg.angle_min
@@ -202,22 +238,75 @@ class FollowingPositionNode(Node):
 
     def leg_center_callback(self, msg):
         if msg.points:
-            self.leg_positions.append((msg.points[0].x, msg.points[0].y))
-            new_theta = self.calculate_movement_direction()
-            if new_theta is not None:
-                self.current_theta = new_theta
-            self.publish_ellipse(msg.points[0].x, msg.points[0].y, self.current_theta)
+            # 保存相對座標系下的腿部位置
+            local_leg_pos = (msg.points[0].x, msg.points[0].y)
+            self.leg_positions.append(local_leg_pos)
+            
+            # 轉換為odom座標系並保存
+            global_leg_pos = self.transform_to_global_frame(local_leg_pos[0], local_leg_pos[1])
+            if global_leg_pos is not None:
+                self.global_leg_positions.append(global_leg_pos)
+                
+                # 使用odom座標系下的位置計算移動方向
+                new_theta = self.calculate_movement_direction()
+                if new_theta is not None:
+                    self.current_theta = new_theta
+                    self.get_logger().info(f"更新移動方向: {self.current_theta:.2f} 弧度")
+                    
+            # 使用原始相對座標發布可視化標記
+            self.publish_ellipse(local_leg_pos[0], local_leg_pos[1], self.current_theta)
 
     def calculate_movement_direction(self):
-        if len(self.leg_positions) < 2:
+        """基於odom座標系計算移動方向"""
+        if len(self.global_leg_positions) < 2:
             return None
-        x_old, y_old = self.leg_positions[0]
-        x_new, y_new = self.leg_positions[-1]
+            
+        # 取最早和最新的odom座標系下的腳部位置
+        x_old, y_old = self.global_leg_positions[0]
+        x_new, y_new = self.global_leg_positions[-1]
+        
+        # 計算實際移動距離
         distance = math.sqrt((x_new - x_old)**2 + (y_new - y_old)**2)
+        
+        # 如果距離小於閾值，認為腳部沒有實質性移動
         if distance < self.movement_threshold:
+            self.get_logger().info(f"移動距離 {distance:.2f} 小於閾值 {self.movement_threshold}，不更新方向")
             return None
+        
+        # 計算移動向量和方向
         vx, vy = x_new - x_old, y_new - y_old
-        return math.atan2(vy, vx)
+        
+        # 計算在odom座標系下的方向
+        global_theta = math.atan2(vy, vx)
+        self.get_logger().info(f"odom座標系下的移動方向: {global_theta:.2f} 弧度")
+        
+        # 獲取機器人當前的變換以將odom座標系下的方向轉換回機器人坐標系
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.robot_frame,
+                self.global_frame,
+                rclpy.time.Time())
+                
+            # 從變換中提取機器人的旋轉角度
+            q = transform.transform.rotation
+            robot_theta = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                     1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+                
+            # 將odom座標系下的方向轉換為相對於機器人的方向
+            relative_theta = global_theta - robot_theta
+            
+            # 確保角度在[-pi, pi]範圍內
+            while relative_theta > math.pi:
+                relative_theta -= 2 * math.pi
+            while relative_theta < -math.pi:
+                relative_theta += 2 * math.pi
+                
+            self.get_logger().info(f"機器人坐標系下的移動方向: {relative_theta:.2f} 弧度")
+            return relative_theta
+            
+        except TransformException as ex:
+            self.get_logger().warning(f"無法獲取機器人變換: {ex}")
+            return None
 
 def main(args=None):
     rclpy.init(args=args)
