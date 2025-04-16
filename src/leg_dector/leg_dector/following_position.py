@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, PointStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import ColorRGBA
@@ -9,6 +9,7 @@ from collections import deque
 import tf2_ros
 import tf2_geometry_msgs
 from tf2_ros import TransformException
+import numpy as np
 
 class FollowingPositionNode(Node):
     def __init__(self):
@@ -21,6 +22,8 @@ class FollowingPositionNode(Node):
         # 添加箭頭的發布者
         self.publisher = self.create_publisher(Marker, 'following_pos_marker', 10)
         self.arrow_publisher = self.create_publisher(Marker, 'robot_to_following_position_vector', 10)
+        # 添加分數標籤的發布者
+        self.score_publisher = self.create_publisher(MarkerArray, 'point_scores', 10)
         
         # 初始化TF2緩衝區和監聽器
         self.tf_buffer = tf2_ros.Buffer()
@@ -33,9 +36,9 @@ class FollowingPositionNode(Node):
         self.current_theta = 0.0
         self.movement_threshold = 0.2
         
-        self.alpha = 1.0
-        self.beta = 1.0
-        self.gamma = 8.0
+        self.alpha = 0.0 #robot to following position
+        self.beta = 1.0  #obstacle to following position
+        self.gamma = 0.0 #leg to following position
         self.max_obs_dist = 2.0
         
         self.robot_pos = (0.0, 0.0)
@@ -44,6 +47,11 @@ class FollowingPositionNode(Node):
         # 設置坐標系（使用odom作為全局參考系）
         self.global_frame = "odom"
         self.robot_frame = "rplidar_link"
+        
+        # 是否顯示所有點的分數
+        self.show_all_scores = True
+        # 顯示總分或分項分數
+        self.show_detailed_scores = False
 
     def transform_to_global_frame(self, x, y):
         """將相對座標轉換為odom坐標系下的坐標"""
@@ -71,28 +79,47 @@ class FollowingPositionNode(Node):
             return None
 
     def calculate_detailed_score(self, x, y):
-        # 計算各個分項分數
+        """計算點 (x, y) 的詳細分數，所有分數都使用正值表示更優的選擇"""
+        # epsilon = 0.1  # 防止除以 0
+        
+        # --- 機器人分數（離機器人越近分數越高）---
         d_robot = math.sqrt((x - self.robot_pos[0])**2 + (y - self.robot_pos[1])**2)
-        robot_score = -self.alpha * d_robot
+        # 將距離轉換為 0-1 範圍的分數，越近分數越高
+        max_robot_dist = 2.0  # 設定一個最大距離閾值
+        robot_score = max(0, 1.0 - d_robot / max_robot_dist)
+        robot_score = self.alpha * robot_score  # 應用權重
         
-        # 修改障礙物分數計算
-        d_obstacle = float('inf')
-        for obs in self.obstacles:
-            dist = math.sqrt((x - obs[0])**2 + (y - obs[1])**2)
-            d_obstacle = min(d_obstacle, dist)
+        # --- 障礙物分數（離障礙物越遠分數越高）---
+        if not self.obstacles:
+            obstacle_score = self.beta  # 如果沒有障礙物，給予最高分
+        else:
+            
+            # 將障礙物資料轉換為 NumPy 陣列
+            obstacles = np.array(self.obstacles)
 
-        # 使用反比關係計算分數：距離越小，分數越低（更負）
-        # 添加一個小常數避免除以零的問題
-        epsilon = 0.05  # 小常數，避免分母為零
-        obstacle_score = -self.beta / (d_obstacle + epsilon)
+            # 計算與所有障礙物的距離
+            dists = np.linalg.norm(obstacles - np.array([x, y]), axis=1)
+
+            # 取得最小距離
+            min_obstacle_dist = np.min(dists)
+
+            # 將距離轉換為 0-1 範圍的分數，越遠分數越高
+            obstacle_score = min(1.0, min_obstacle_dist / self.max_obs_dist)
         
-        leg_score = 0
+        # --- 腳分數（離腳越近分數越高）---
         if self.leg_positions:
             leg_x, leg_y = self.leg_positions[-1]
             d_leg = math.sqrt((x - leg_x)**2 + (y - leg_y)**2)
-            leg_score = -self.gamma * d_leg
+            # 將距離轉換為 0-1 範圍的分數，越近分數越高
+            max_leg_dist = 1.5  # 設定一個最大距離閾值
+            leg_score = max(0, 1.0 - d_leg / max_leg_dist)
+            leg_score = self.gamma * leg_score  # 應用權重
+        else:
+            leg_score = 0.0
         
+        # --- 總分 (所有分數都是正值，越高越好) ---
         total_score = robot_score + obstacle_score + leg_score
+        
         return robot_score, obstacle_score, leg_score, total_score
 
     def publish_arrow(self, start_point, best_point):
@@ -130,6 +157,73 @@ class FollowingPositionNode(Node):
         marker.color.a = 1.0
         
         self.arrow_publisher.publish(marker)
+
+    def publish_score_labels(self, points_and_scores):
+        """發布分數標籤作為文本標記"""
+        marker_array = MarkerArray()
+        
+        for i, (point, score_tuple) in enumerate(points_and_scores):
+            robot_score, obstacle_score, leg_score, total_score = score_tuple
+            
+            # 只發布部分點的分數標籤（每隔幾個點發布一個）或特別高分的點
+            if not self.show_all_scores and i % 5 != 0 and total_score < 0.8 * max([s[3] for _, s in points_and_scores]):
+                continue
+                
+            marker = Marker()
+            marker.header.frame_id = self.robot_frame
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "score_labels"
+            marker.id = i
+            marker.type = Marker.TEXT_VIEW_FACING
+            marker.action = Marker.ADD
+            
+            # 計算標籤的偏移位置
+        # 根據點在橢圓上的位置，將標籤向外偏移
+            vector_to_center_x = point.x - self.leg_positions[-1][0] if self.leg_positions else point.x
+            vector_to_center_y = point.y - self.leg_positions[-1][1] if self.leg_positions else point.y
+            
+            # 計算向量長度
+            vector_length = math.sqrt(vector_to_center_x**2 + vector_to_center_y**2)
+            
+            # 標準化向量並設置偏移距離
+            offset_distance = 0.15  # 調整此值可以改變標籤與點的距離
+            
+            if vector_length > 0.01:  # 避免除以零
+                # 將標籤沿著從中心向外的方向偏移
+                offset_x = (vector_to_center_x / vector_length) * offset_distance
+                offset_y = (vector_to_center_y / vector_length) * offset_distance
+            else:
+                # 如果點非常接近中心，使用默認偏移
+                offset_x = offset_distance
+                offset_y = 0
+            
+            # 設置文本位置（向外偏移以避免與點重疊）
+            marker.pose.position.x = point.x + offset_x
+            marker.pose.position.y = point.y + offset_y
+            marker.pose.position.z = 0.1  # 稍微抬高文本
+            marker.pose.orientation.w = 1.0
+            
+            # 設置文本大小
+            marker.scale.z = 0.05  # 文本高度
+            
+            # 根據分數設置顏色（使用與點相同的顏色映射）
+            r, g, b = self.get_color_from_score(total_score, 
+                                            min([s[3] for _, s in points_and_scores]),
+                                            max([s[3] for _, s in points_and_scores]))
+            marker.color.r = float(r)
+            marker.color.g = float(g)
+            marker.color.b = float(b)
+            marker.color.a = 1.0
+            
+            # 設置文本內容
+            if self.show_detailed_scores:
+                marker.text = f"R:{robot_score:.1f} O:{obstacle_score:.1f} L:{leg_score:.1f} T:{total_score:.1f}"
+            else:
+                marker.text = f"{total_score:.2f}"
+                
+            marker_array.markers.append(marker)
+            
+        self.score_publisher.publish(marker_array)
 
     def publish_ellipse(self, center_x, center_y, theta):
         marker = Marker()
@@ -189,10 +283,13 @@ class FollowingPositionNode(Node):
             marker.colors.append(color)
         
         self.publisher.publish(marker)
+        
+        # 發布分數標籤
+        self.publish_score_labels(points_and_scores)
 
     def generate_ellipse_points_with_scores(self, center_x, center_y, theta):
         points_and_scores = []
-        num_points = 100
+        num_points = 50
         cos_theta = math.cos(theta)
         sin_theta = math.sin(theta)
         
@@ -307,7 +404,7 @@ class FollowingPositionNode(Node):
         except TransformException as ex:
             self.get_logger().warning(f"無法獲取機器人變換: {ex}")
             return None
-
+    
 def main(args=None):
     rclpy.init(args=args)
     node = FollowingPositionNode()
