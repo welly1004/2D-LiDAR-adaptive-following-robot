@@ -21,9 +21,11 @@ class FollowingPositionNode(Node):
         
         # 添加箭頭的發布者
         self.publisher = self.create_publisher(Marker, 'following_pos_marker', 10)
-        self.arrow_publisher = self.create_publisher(Marker, 'robot_to_following_position_vector', 10)
+        self.arrow_pub = self.create_publisher(Marker, 'robot_to_following_position_vector', 10)
         # 添加分數標籤的發布者
-        self.score_publisher = self.create_publisher(MarkerArray, 'point_scores', 10)
+        self.score_text_pub = self.create_publisher(MarkerArray, 'score_text_markers', 10)
+
+
         
         # 初始化TF2緩衝區和監聽器
         self.tf_buffer = tf2_ros.Buffer()
@@ -34,11 +36,12 @@ class FollowingPositionNode(Node):
         self.leg_positions = deque(maxlen=5)      # 相對座標下的腿部位置
         self.global_leg_positions = deque(maxlen=5)  # 全局座標下的腿部位置
         self.current_theta = 0.0
+        self.global_theta = 0.0  # 全局座標系中的方向角
         self.movement_threshold = 0.2
         
-        self.alpha = 0.0 #robot to following position
+        self.alpha = 1.0 #robot to following position
         self.beta = 1.0  #obstacle to following position
-        self.gamma = 0.0 #leg to following position
+        self.gamma = 1.0 #leg to following position
         self.max_obs_dist = 2.0
         
         self.robot_pos = (0.0, 0.0)
@@ -52,7 +55,7 @@ class FollowingPositionNode(Node):
         self.show_all_scores = True
         # 顯示總分或分項分數
         self.show_detailed_scores = False
-
+        self.last_marker_count = 0
     def transform_to_global_frame(self, x, y):
         """將相對座標轉換為odom坐標系下的坐標"""
         try:
@@ -74,6 +77,31 @@ class FollowingPositionNode(Node):
             global_point = tf2_geometry_msgs.do_transform_point(point_stamped, transform)
             
             return (global_point.point.x, global_point.point.y)
+        except TransformException as ex:
+            self.get_logger().warning(f"無法轉換座標: {ex}")
+            return None
+
+    def transform_from_global_to_robot_frame(self, x, y):
+        """將全局座標轉換為機器人座標系下的坐標"""
+        try:
+            # 創建帶時間戳的點
+            point_stamped = PointStamped()
+            point_stamped.header.frame_id = self.global_frame
+            point_stamped.header.stamp = self.get_clock().now().to_msg()
+            point_stamped.point.x = x
+            point_stamped.point.y = y
+            point_stamped.point.z = 0.0
+            
+            # 執行轉換
+            transform = self.tf_buffer.lookup_transform(
+                self.robot_frame,
+                self.global_frame,
+                rclpy.time.Time())
+                
+            # 轉換點
+            local_point = tf2_geometry_msgs.do_transform_point(point_stamped, transform)
+            
+            return (local_point.point.x, local_point.point.y)
         except TransformException as ex:
             self.get_logger().warning(f"無法轉換座標: {ex}")
             return None
@@ -122,112 +150,124 @@ class FollowingPositionNode(Node):
         
         return robot_score, obstacle_score, leg_score, total_score
 
+    def transform_angle_to_robot_frame(self, global_angle):
+        """將角度從全局座標系（odom）轉換到機器人座標系"""
+        try:
+            # 獲取從odom到機器人座標系的變換
+            transform = self.tf_buffer.lookup_transform(
+                self.robot_frame,
+                self.global_frame,
+                rclpy.time.Time())
+                
+            # 從變換中提取機器人相對於odom的旋轉角度
+            q = transform.transform.rotation
+            robot_theta = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                    1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+                
+            # 將全局角度轉換為機器人座標系
+            robot_relative_theta = global_angle - robot_theta
+            
+            # 確保角度在[-pi, pi]範圍內
+            while robot_relative_theta > math.pi:
+                robot_relative_theta -= 2 * math.pi
+            while robot_relative_theta < -math.pi:
+                robot_relative_theta += 2 * math.pi
+                
+            self.get_logger().info(f"機器人座標系下的移動方向: {robot_relative_theta:.2f} 弧度")
+            return robot_relative_theta
+            
+        except TransformException as ex:
+            self.get_logger().warning(f"無法獲取機器人變換: {ex}")
+            return self.current_theta  # 變換失敗時回退到當前角度
+
     def publish_arrow(self, start_point, best_point):
         marker = Marker()
-        marker.header.frame_id = self.robot_frame
-        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.header.frame_id = self.global_frame
+        marker.header.stamp = rclpy.time.Time().to_msg()  # 避免TF錯誤
         marker.ns = "best_direction"
         marker.id = 0
         marker.type = Marker.ARROW
         marker.action = Marker.ADD
-        
-        # 設置箭頭起點和終點
+
         marker.points = []
+
+        # Z軸高度
+        z_height = 0.1
+
+        global_start = self.transform_to_global_frame(start_point[0], start_point[1])
+        if global_start is None:
+            return
+
         start = Point()
-        start.x = start_point[0]
-        start.y = start_point[1]
-        start.z = 0.0
+        start.x = global_start[0]
+        start.y = global_start[1]
+        start.z = z_height
         marker.points.append(start)
-        
+
         end = Point()
         end.x = best_point[0]
         end.y = best_point[1]
-        end.z = 0.0
+        end.z = z_height
         marker.points.append(end)
-        
-        # 設置箭頭的大小
-        marker.scale.x = 0.02  # 箭桿寬度
-        marker.scale.y = 0.04   # 箭頭寬度
-        marker.scale.z = 0.0   # 箭頭長度
-        
-        # 設置箭頭顏色（白色）
+
+        marker.scale.x = 0.02  # 桿寬
+        marker.scale.y = 0.04  # 頭寬
+        marker.scale.z = 0.2   # 頭長（要是正的）
+
         marker.color.r = 1.0
         marker.color.g = 1.0
         marker.color.b = 1.0
         marker.color.a = 1.0
-        
-        self.arrow_publisher.publish(marker)
 
-    def publish_score_labels(self, points_and_scores):
-        """發布分數標籤作為文本標記"""
-        marker_array = MarkerArray()
+        self.arrow_pub.publish(marker)
+
+
+
+    def generate_ellipse_points_with_scores_in_global_frame(self, center_x, center_y, theta):
+        """在全局座標系中生成橢圓形的點和分數"""
+        points_and_scores = []
+        num_points = 50
+        cos_theta = math.cos(theta)
+        sin_theta = math.sin(theta)
         
-        for i, (point, score_tuple) in enumerate(points_and_scores):
-            robot_score, obstacle_score, leg_score, total_score = score_tuple
+        # 先將中心點轉換到全局座標系
+        global_center = self.transform_to_global_frame(center_x, center_y)
+        if global_center is None:
+            return []
+        
+        center_x_global, center_y_global = global_center
+        
+        for i in range(num_points):
+            angle = 2 * math.pi * i / num_points
+            x = self.circle_radius_x * math.cos(angle)
+            y = self.circle_radius_y * math.sin(angle)
             
-            # 只發布部分點的分數標籤（每隔幾個點發布一個）或特別高分的點
-            if not self.show_all_scores and i % 5 != 0 and total_score < 0.8 * max([s[3] for _, s in points_and_scores]):
-                continue
-                
-            marker = Marker()
-            marker.header.frame_id = self.robot_frame
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "score_labels"
-            marker.id = i
-            marker.type = Marker.TEXT_VIEW_FACING
-            marker.action = Marker.ADD
+            x_rot = x * cos_theta - y * sin_theta
+            y_rot = x * sin_theta + y * cos_theta
             
-            # 計算標籤的偏移位置
-        # 根據點在橢圓上的位置，將標籤向外偏移
-            vector_to_center_x = point.x - self.leg_positions[-1][0] if self.leg_positions else point.x
-            vector_to_center_y = point.y - self.leg_positions[-1][1] if self.leg_positions else point.y
+            final_x = center_x_global + x_rot
+            final_y = center_y_global + y_rot
             
-            # 計算向量長度
-            vector_length = math.sqrt(vector_to_center_x**2 + vector_to_center_y**2)
+            point = Point()
+            point.x = final_x
+            point.y = final_y
+            point.z = 0.0
             
-            # 標準化向量並設置偏移距離
-            offset_distance = 0.15  # 調整此值可以改變標籤與點的距離
-            
-            if vector_length > 0.01:  # 避免除以零
-                # 將標籤沿著從中心向外的方向偏移
-                offset_x = (vector_to_center_x / vector_length) * offset_distance
-                offset_y = (vector_to_center_y / vector_length) * offset_distance
+            # 獲取詳細分數
+            # 如果分數計算需要在機器人座標系中，先轉換回機器人座標系
+            local_point = self.transform_from_global_to_robot_frame(final_x, final_y)
+            if local_point:
+                scores = self.calculate_detailed_score(local_point[0], local_point[1])
             else:
-                # 如果點非常接近中心，使用默認偏移
-                offset_x = offset_distance
-                offset_y = 0
+                scores = (0, 0, 0, 0)  # 默認分數
             
-            # 設置文本位置（向外偏移以避免與點重疊）
-            marker.pose.position.x = point.x + offset_x
-            marker.pose.position.y = point.y + offset_y
-            marker.pose.position.z = 0.1  # 稍微抬高文本
-            marker.pose.orientation.w = 1.0
+            points_and_scores.append((point, scores))
             
-            # 設置文本大小
-            marker.scale.z = 0.05  # 文本高度
-            
-            # 根據分數設置顏色（使用與點相同的顏色映射）
-            r, g, b = self.get_color_from_score(total_score, 
-                                            min([s[3] for _, s in points_and_scores]),
-                                            max([s[3] for _, s in points_and_scores]))
-            marker.color.r = float(r)
-            marker.color.g = float(g)
-            marker.color.b = float(b)
-            marker.color.a = 1.0
-            
-            # 設置文本內容
-            if self.show_detailed_scores:
-                marker.text = f"R:{robot_score:.1f} O:{obstacle_score:.1f} L:{leg_score:.1f} T:{total_score:.1f}"
-            else:
-                marker.text = f"{total_score:.2f}"
-                
-            marker_array.markers.append(marker)
-            
-        self.score_publisher.publish(marker_array)
+        return points_and_scores
 
     def publish_ellipse(self, center_x, center_y, theta):
         marker = Marker()
-        marker.header.frame_id = self.robot_frame
+        marker.header.frame_id = self.global_frame  # 使用全局參考系
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "ellipse"
         marker.id = 0
@@ -238,7 +278,12 @@ class FollowingPositionNode(Node):
         marker.scale.y = 0.05
         marker.scale.z = 0.05
         
-        points_and_scores = self.generate_ellipse_points_with_scores(center_x, center_y, theta)
+        # 使用全局座標系和全局方向生成橢圓點
+        points_and_scores = self.generate_ellipse_points_with_scores_in_global_frame(center_x, center_y, self.global_theta)
+        
+        if not points_and_scores:
+            self.get_logger().warning("無法生成橢圓點")
+            return
         
         # 找出最高分數的點
         best_point = None
@@ -262,8 +307,8 @@ class FollowingPositionNode(Node):
                 best_score = total_score
                 best_point = (point.x, point.y)
         
-        min_score = min(scores)
-        max_score = max(scores)
+        min_score = min(scores) if scores else 0
+        max_score = max(scores) if scores else 1
         
         # 發布指向最佳點的箭頭
         if best_point:
@@ -285,37 +330,61 @@ class FollowingPositionNode(Node):
         self.publisher.publish(marker)
         
         # 發布分數標籤
-        self.publish_score_labels(points_and_scores)
+        text_marker_array = MarkerArray()
 
-    def generate_ellipse_points_with_scores(self, center_x, center_y, theta):
-        points_and_scores = []
-        num_points = 50
-        cos_theta = math.cos(theta)
-        sin_theta = math.sin(theta)
-        
-        for i in range(num_points):
-            angle = 2 * math.pi * i / num_points
-            x = self.circle_radius_x * math.cos(angle)
-            y = self.circle_radius_y * math.sin(angle)
+        for i, (point, score_tuple) in enumerate(points_and_scores):
+            marker = Marker()
+            marker.header.frame_id = self.global_frame
+            marker.header.stamp = rclpy.time.Time().to_msg()
+            marker.ns = "score_labels"
+            marker.id = i
+            marker.type = Marker.TEXT_VIEW_FACING
+            marker.action = Marker.ADD
             
-            x_rot = x * cos_theta - y * sin_theta
-            y_rot = x * sin_theta + y * cos_theta
+            # 計算偏移量，避免文字和點重疊
+            dx = point.x - center_x  
+            dy = point.y - center_y  
+            norm = math.hypot(dx, dy)
             
-            final_x = center_x + x_rot
-            final_y = center_y + y_rot
-            
-            point = Point()
-            point.x = final_x
-            point.y = final_y
-            point.z = 0.0
-            
-            # 獲取詳細分數
-            scores = self.calculate_detailed_score(final_x, final_y)
-            
-            points_and_scores.append((point, scores))
-            
-        return points_and_scores
+            # 計算偏移向量（單位方向 * 偏移距離）
+            offset_dist = 0.0  # 偏移的距離，可以調整
+            offset_x = (dx / norm) * offset_dist if norm != 0 else 0.0
+            offset_y = (dy / norm) * offset_dist if norm != 0 else 0.0
 
+            # 將文字稍微抬高並偏移
+            marker.pose.position.x = point.x + offset_x
+            marker.pose.position.y = point.y + offset_y
+            marker.pose.position.z = 0.3  # 這裡是讓文字往上浮一些，避免與點重疊
+
+            marker.pose.orientation.w = 1.0
+            marker.scale.z = 0.03  # 控制文字大小
+            marker.color.r = 1.0
+            marker.color.g = 1.0
+            marker.color.b = 1.0
+            marker.color.a = 1.0
+            marker.text = f"{score_tuple[3]:.2f}"
+
+            # 將 marker 加入到 MarkerArray 中
+            text_marker_array.markers.append(marker)
+
+        # 發布 MarkerArray
+        self.score_text_pub.publish(text_marker_array)
+
+        # 刪除多出來的舊 markers
+        for j in range(len(points_and_scores), self.last_marker_count):
+            delete_marker = Marker()
+            delete_marker.header.frame_id = self.global_frame
+            delete_marker.header.stamp = self.get_clock().now().to_msg()
+            delete_marker.ns = "score_labels"
+            delete_marker.id = j
+            delete_marker.action = Marker.DELETE
+            text_marker_array.markers.append(delete_marker)
+
+        # 更新記錄
+        self.last_marker_count = len(points_and_scores)
+
+        # 發布
+        self.score_text_pub.publish(text_marker_array)
     def scan_callback(self, msg):
         self.obstacles = []
         angle = msg.angle_min
@@ -333,9 +402,36 @@ class FollowingPositionNode(Node):
             normalized = (score - min_score) / (max_score - min_score)
         return normalized, normalized, normalized
 
+    def calculate_movement_direction(self):
+        """計算全局座標系（odom）中的移動方向"""
+        if len(self.global_leg_positions) < 2:
+            return None
+            
+        # 獲取odom座標系中最早和最新的腿部位置
+        x_old, y_old = self.global_leg_positions[0]
+        x_new, y_new = self.global_leg_positions[-1]
+        
+        # 計算實際移動距離
+        distance = math.sqrt((x_new - x_old)**2 + (y_new - y_old)**2)
+        
+        # 如果距離小於閾值，認為沒有實質性移動
+        if distance < self.movement_threshold:
+            self.get_logger().info(f"移動距離 {distance:.2f} 小於閾值 {self.movement_threshold}，不更新方向")
+            return None
+        
+        # 計算odom座標系中的移動向量和方向
+        vx, vy = x_new - x_old, y_new - y_old
+        
+        # 計算odom座標系中的方向
+        global_theta = math.atan2(vy, vx)
+        self.get_logger().info(f"odom座標系下的移動方向: {global_theta:.2f} 弧度")
+        
+        # 返回全局方向，不轉換到機器人座標系
+        return global_theta
+
     def leg_center_callback(self, msg):
         if msg.points:
-            # 保存相對座標系下的腿部位置
+            # 保存機器人相對座標系下的腿部位置
             local_leg_pos = (msg.points[0].x, msg.points[0].y)
             self.leg_positions.append(local_leg_pos)
             
@@ -344,66 +440,14 @@ class FollowingPositionNode(Node):
             if global_leg_pos is not None:
                 self.global_leg_positions.append(global_leg_pos)
                 
-                # 使用odom座標系下的位置計算移動方向
-                new_theta = self.calculate_movement_direction()
-                if new_theta is not None:
-                    self.current_theta = new_theta
-                    self.get_logger().info(f"更新移動方向: {self.current_theta:.2f} 弧度")
-                    
-            # 使用原始相對座標發布可視化標記
-            self.publish_ellipse(local_leg_pos[0], local_leg_pos[1], self.current_theta)
-
-    def calculate_movement_direction(self):
-        """基於odom座標系計算移動方向"""
-        if len(self.global_leg_positions) < 2:
-            return None
-            
-        # 取最早和最新的odom座標系下的腳部位置
-        x_old, y_old = self.global_leg_positions[0]
-        x_new, y_new = self.global_leg_positions[-1]
-        
-        # 計算實際移動距離
-        distance = math.sqrt((x_new - x_old)**2 + (y_new - y_old)**2)
-        
-        # 如果距離小於閾值，認為腳部沒有實質性移動
-        if distance < self.movement_threshold:
-            self.get_logger().info(f"移動距離 {distance:.2f} 小於閾值 {self.movement_threshold}，不更新方向")
-            return None
-        
-        # 計算移動向量和方向
-        vx, vy = x_new - x_old, y_new - y_old
-        
-        # 計算在odom座標系下的方向
-        global_theta = math.atan2(vy, vx)
-        self.get_logger().info(f"odom座標系下的移動方向: {global_theta:.2f} 弧度")
-        
-        # 獲取機器人當前的變換以將odom座標系下的方向轉換回機器人坐標系
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.robot_frame,
-                self.global_frame,
-                rclpy.time.Time())
+                # 計算全局座標系中的移動方向
+                new_global_theta = self.calculate_movement_direction()
+                if new_global_theta is not None:
+                    self.global_theta = new_global_theta  # 存儲全局方向
+                    self.get_logger().info(f"更新全局移動方向: {self.global_theta:.2f} 弧度")
                 
-            # 從變換中提取機器人的旋轉角度
-            q = transform.transform.rotation
-            robot_theta = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                                     1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-                
-            # 將odom座標系下的方向轉換為相對於機器人的方向
-            relative_theta = global_theta - robot_theta
-            
-            # 確保角度在[-pi, pi]範圍內
-            while relative_theta > math.pi:
-                relative_theta -= 2 * math.pi
-            while relative_theta < -math.pi:
-                relative_theta += 2 * math.pi
-                
-            self.get_logger().info(f"機器人坐標系下的移動方向: {relative_theta:.2f} 弧度")
-            return relative_theta
-            
-        except TransformException as ex:
-            self.get_logger().warning(f"無法獲取機器人變換: {ex}")
-            return None
+                # 使用原始相對座標和全局方向發布可視化標記
+                self.publish_ellipse(local_leg_pos[0], local_leg_pos[1], self.global_theta)
     
 def main(args=None):
     rclpy.init(args=args)
