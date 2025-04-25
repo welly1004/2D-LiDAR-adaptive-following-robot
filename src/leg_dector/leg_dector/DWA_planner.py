@@ -1,10 +1,14 @@
 import rclpy, math, time
 from rclpy.node import Node
 import numpy as np
-from geometry_msgs.msg import Twist, Point
+from geometry_msgs.msg import Twist, Point, PointStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from sensor_msgs.msg import LaserScan
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+import tf2_ros
+import tf2_geometry_msgs
+from tf2_ros import TransformException
+import numpy as np
 
 
 
@@ -16,7 +20,13 @@ class DWAPathPlanner(Node):
         self.obstacle_weight = 1.0  # 障礙物權重
         self.goal_weight = 5.0  # 目標點權重
         self.velocity_weight = 0.5  # 速度權重
-
+        
+        self.global_frame = 'odom'
+        self.robot_frame = 'rplidar_link'
+        
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        
         # 發佈路徑
         self.DWA_path_publisher = self.create_publisher(MarkerArray, '/dwa_paths', 10)
         self.cmd_vel_publisher = self.create_publisher(Twist,'/cmd_vel',10)
@@ -47,11 +57,29 @@ class DWAPathPlanner(Node):
         self.best_path_velocity = None
    
 
-    def vector_arrows_callback(self,msg):
+    def vector_arrows_callback(self, msg):
         if len(msg.points) > 1:
             self.target_point = msg.points[1]
+
+            # 拿到全局座標中的 x, y
+            x = self.target_point.x
+            y = self.target_point.y
+
+            # 嘗試轉換為 rplidar_link 座標系
+            local_coords = self.transform_to_local_frame(x, y)
+            
+            if local_coords:
+                local_x, local_y = local_coords
+                self.target_point = Point()
+                self.target_point.x = local_x
+                self.target_point.y = local_y
+                self.target_point.z = 0.0  # 可選
+                
+                self.get_logger().info(f"Transformed point to rplidar_link frame: x={local_x:.2f}, y={local_y:.2f}")
+            else:
+                self.get_logger().warn("轉換失敗，local_coords 為 None")
         else:
-            self.target_point = None 
+            self.target_point = None
 
     def cmd_vel_callback(self, msg):
         # 更新當前速度
@@ -72,7 +100,31 @@ class DWAPathPlanner(Node):
             y = range_value * math.sin(angle)
             self.obstacle_points.append((x, y))
 
+    def transform_to_local_frame(self, x, y):
+        """將全局座標轉換為機器人座標系下的座標"""
+        try:
+            point_stamped = PointStamped()
+            point_stamped.header.frame_id = self.global_frame  # 通常是 'odom'
+            point_stamped.header.stamp =  rclpy.time.Time().to_msg()
+            point_stamped.point.x = x
+            point_stamped.point.y = y
+            point_stamped.point.z = 0.0
 
+            # 執行轉換
+            transform = self.tf_buffer.lookup_transform(
+                self.robot_frame,     # 通常是 'rplidar_link'
+                self.global_frame,    # 通常是 'odom'
+                rclpy.time.Time()
+            )
+
+            # 轉換點
+            local_point = tf2_geometry_msgs.do_transform_point(point_stamped, transform)
+
+            return (local_point.point.x, local_point.point.y)
+
+        except TransformException as ex:
+            self.get_logger().warning(f"無法轉換座標: {ex}")
+            return None
 
     def check_point_obstacle(self, point, safety_margin=0.2, angle_window=15):
         # 檢查指定點是否與障礙物相撞
