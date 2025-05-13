@@ -37,12 +37,16 @@ class FollowingPositionNode(Node):
         self.global_leg_positions = deque(maxlen=5)  # 全局座標下的腿部位置
         self.current_theta = 0.0
         self.global_theta = 0.0  # 全局座標系中的方向角
-        self.movement_threshold = 0.2
+        self.movement_threshold = 0.1
+
+
+
         
-        self.alpha = 1.0 #robot to following position
-        self.beta = 1.0  #obstacle to following position
-        self.gamma = 1.0 #leg to following position
-        self.max_obs_dist = 2.0
+        
+        self.alpha = 0.8 #robot to following position
+        self.beta =  5.0 #obstacle to following position
+        self.gamma = 5.8 #leg to following position
+        self.max_obs_dist = 0.45
         
         self.robot_pos = (0.0, 0.0)
         self.obstacles = []
@@ -56,6 +60,17 @@ class FollowingPositionNode(Node):
         # 顯示總分或分項分數
         self.show_detailed_scores = False
         self.last_marker_count = 0
+
+        # 初始化上一筆腿部資料的時間與位置
+        self.prev_leg_time = None
+        self.prev_leg_pos = None
+
+        # 記錄下一個橢圓中心點的全局座標
+        self.next_leg_global = None
+
+        # RViz 上標示 next_leg 點
+        self.next_leg_pub = self.create_publisher(Marker, 'next_leg_marker', 10)
+
     def transform_to_global_frame(self, x, y):
         """將相對座標轉換為odom坐標系下的坐標"""
         try:
@@ -268,7 +283,7 @@ class FollowingPositionNode(Node):
     def publish_ellipse(self, center_x, center_y, theta):
         marker = Marker()
         marker.header.frame_id = self.global_frame  # 使用全局參考系
-        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.header.stamp = rclpy.time.Time().to_msg()
         marker.ns = "ellipse"
         marker.id = 0
         marker.type = Marker.SPHERE_LIST
@@ -428,26 +443,101 @@ class FollowingPositionNode(Node):
         
         # 返回全局方向，不轉換到機器人座標系
         return global_theta
-
     def leg_center_callback(self, msg):
-        if msg.points:
-            # 保存機器人相對座標系下的腿部位置
-            local_leg_pos = (msg.points[0].x, msg.points[0].y)
-            self.leg_positions.append(local_leg_pos)
+        if not msg.points:
+            return
+
+        local_leg_pos = (msg.points[0].x, msg.points[0].y)
+        self.leg_positions.append(local_leg_pos)
+
+        global_leg_pos = self.transform_to_global_frame(local_leg_pos[0], local_leg_pos[1])
+        if global_leg_pos is None:
+            return
+
+        self.global_leg_positions.append(global_leg_pos)
+
+        # 計算速度與 delta_t
+        now = self.get_clock().now()
+        if self.prev_leg_time and self.prev_leg_pos:
+            dt = (now - self.prev_leg_time).nanoseconds / 1e9  # 轉換為秒
+            if dt > 0:
+                dx = global_leg_pos[0] - self.prev_leg_pos[0]
+                dy = global_leg_pos[1] - self.prev_leg_pos[1]
+                vx = dx / dt
+                vy = dy / dt
+
+                # 預測下一個位置：下一刻橢圓中心 = 目前位置 + v * Δt
+                prediction_dt = 0.5 # 預測未來 0.5 秒的位置
+                next_leg_x = global_leg_pos[0] + vx * prediction_dt
+                next_leg_y = global_leg_pos[1] + vy * prediction_dt
+            else:
+                next_leg_x, next_leg_y = global_leg_pos
+        else:
+            next_leg_x, next_leg_y = global_leg_pos
+
+        # 更新記錄
+        self.prev_leg_time = now
+        self.prev_leg_pos = global_leg_pos
+
+        # 存儲並發布 next_leg
+        self.next_leg_global = (next_leg_x, next_leg_y)
+        self.publish_next_leg_marker(next_leg_x, next_leg_y)
+
+        # 計算方向角
+        new_global_theta = self.calculate_movement_direction()
+        if new_global_theta is not None:
+            self.global_theta = new_global_theta
+
+        # 轉回 robot frame 使用 publish_ellipse（中心點是 next_leg）
+        next_leg_local = self.transform_from_global_to_robot_frame(next_leg_x, next_leg_y)
+        if next_leg_local:
+            self.publish_ellipse(next_leg_local[0], next_leg_local[1], self.global_theta)
+
+    # def leg_center_callback(self, msg):
+    #     if msg.points:
+    #         # 保存機器人相對座標系下的腿部位置
+    #         local_leg_pos = (msg.points[0].x, msg.points[0].y)
+    #         self.leg_positions.append(local_leg_pos)
             
-            # 轉換為odom座標系並保存
-            global_leg_pos = self.transform_to_global_frame(local_leg_pos[0], local_leg_pos[1])
-            if global_leg_pos is not None:
-                self.global_leg_positions.append(global_leg_pos)
+    #         # 轉換為odom座標系並保存
+    #         global_leg_pos = self.transform_to_global_frame(local_leg_pos[0], local_leg_pos[1])
+    #         if global_leg_pos is not None:
+    #             self.global_leg_positions.append(global_leg_pos)
                 
-                # 計算全局座標系中的移動方向
-                new_global_theta = self.calculate_movement_direction()
-                if new_global_theta is not None:
-                    self.global_theta = new_global_theta  # 存儲全局方向
-                    self.get_logger().info(f"更新全局移動方向: {self.global_theta:.2f} 弧度")
+    #             # 計算全局座標系中的移動方向
+    #             new_global_theta = self.calculate_movement_direction()
+    #             if new_global_theta is not None:
+    #                 self.global_theta = new_global_theta  # 存儲全局方向
+    #                 self.get_logger().info(f"更新全局移動方向: {self.global_theta:.2f} 弧度")
                 
-                # 使用原始相對座標和全局方向發布可視化標記
-                self.publish_ellipse(local_leg_pos[0], local_leg_pos[1], self.global_theta)
+    #             # 使用原始相對座標和全局方向發布可視化標記
+    #             self.publish_ellipse(local_leg_pos[0], local_leg_pos[1], self.global_theta)
+
+    def publish_next_leg_marker(self, x, y):
+        marker = Marker()
+        marker.header.frame_id = self.global_frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "next_leg"
+        marker.id = 999
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.1
+        marker.pose.orientation.w = 1.0
+
+        marker.scale.x = 0.08
+        marker.scale.y = 0.08
+        marker.scale.z = 0.08
+
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+
+        self.next_leg_pub.publish(marker)
+
     
 def main(args=None):
     rclpy.init(args=args)
