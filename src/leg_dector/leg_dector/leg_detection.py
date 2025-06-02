@@ -14,13 +14,55 @@ import matplotlib.dates as mdates
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
-import tf_transformations
+
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Bool
-from tf_transformations import quaternion_from_euler
+
 from geometry_msgs.msg import Point, Quaternion
 
 import math
+
+
+
+def quaternion_to_rotation_matrix(quaternion):
+    """Convert quaternion [x, y, z, w] to a 3x3 rotation matrix."""
+    x, y, z, w = quaternion
+    n = x*x + y*y + z*z + w*w
+    if n < np.finfo(float).eps:
+        return np.identity(3)
+    s = 2.0 / n
+    xx, yy, zz = x * x * s, y * y * s, z * z * s
+    xy, xz, yz = x * y * s, x * z * s, y * z * s
+    wx, wy, wz = w * x * s, w * y * s, w * z * s
+
+    return np.array([
+        [1.0 - (yy + zz),     xy - wz,         xz + wy],
+        [    xy + wz,     1.0 - (xx + zz),     yz - wx],
+        [    xz - wy,         yz + wx,     1.0 - (xx + yy)]
+    ])
+
+def quaternion_from_euler(roll, pitch, yaw):
+    """Convert Euler angles to quaternion.
+    Args:
+        roll: rotation around x-axis in radians
+        pitch: rotation around y-axis in radians
+        yaw: rotation around z-axis in radians
+    Returns:
+        Quaternion as [x, y, z, w]
+    """
+    cy = np.cos(yaw * 0.5)
+    sy = np.sin(yaw * 0.5)
+    cp = np.cos(pitch * 0.5)
+    sp = np.sin(pitch * 0.5)
+    cr = np.cos(roll * 0.5)
+    sr = np.sin(roll * 0.5)
+
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+
+    return [qx, qy, qz, qw]
 class LegDetectionNode(Node):
     def __init__(self):
         super().__init__('leg_detection')
@@ -115,12 +157,12 @@ class LegDetectionNode(Node):
         pose.header.stamp = self.get_clock().now().to_msg()
         pose.header.frame_id = 'odom'
         # pose.pose=self.current_robot_pose
-        rotation_matrix=tf_transformations.quaternion_matrix( [
+        rotation_matrix=quaternion_to_rotation_matrix( [
     self.current_robot_pose.orientation.x,
     self.current_robot_pose.orientation.y,
     self.current_robot_pose.orientation.z,
     self.current_robot_pose.orientation.w
-])[:3, :3]
+])
         x,y,_=np.dot(  rotation_matrix,   [x,y,0.0]  )
         x,y=np.dot(  [[0,-1],[1,0]],   [x,y]  )
         x = x + self.current_robot_pose.position.x
@@ -179,7 +221,7 @@ class LegDetectionNode(Node):
                 temp.data = True
                 # self.start_position_publisher.publish(self.current_robot_pose)
                 self.go_back_publisher.publish(temp)
-                rclpy.shutdown()  # 关闭ROS节点
+                # rclpy.shutdown()  
                 return
 
     def detect_leg_points(self, scan_msg):
@@ -206,7 +248,7 @@ class LegDetectionNode(Node):
 
         clustering_successful = False
         if len(self.points) > 0:
-            clustering = DBSCAN(eps=0.1, min_samples=30).fit(self.points)
+            clustering = DBSCAN(eps=0.1, min_samples=50).fit(self.points)
             clustering_successful = True
 
         leg_points = []
@@ -495,7 +537,7 @@ class LegDetectionNode(Node):
         self.clear_distance(frame_id)
         self.clear_cluster(frame_id)
         self.clear_path()
-        self.clear_robot_trajectory()
+        self.clear_robot_trajectory()  
 
 
     # def destroy_node(self):
