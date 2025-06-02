@@ -7,9 +7,8 @@ from sensor_msgs.msg import LaserScan
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 import tf2_ros
 import tf2_geometry_msgs
-from tf2_ros import TransformException
+from tf2_ros import Buffer, TransformException, TransformListener
 import numpy as np
-
 
 
 class DWAPathPlanner(Node):
@@ -17,25 +16,29 @@ class DWAPathPlanner(Node):
         super().__init__('dwa_path_planner')
 
         # 初始化參數
-        self.obstacle_weight = 1.0  # 障礙物權重
-        self.goal_weight = 5.0  # 目標點權重
-        self.velocity_weight = 0.5  # 速度權重
+        self.obstacle_weight = 0.28  # 障礙物權重
+        self.goal_weight = 0.7     # 目標點權重
+        self.velocity_weight = 0.02 # 速度權重
         
         self.global_frame = 'odom'
         self.robot_frame = 'rplidar_link'
         
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        
+        tf_ready = self.wait_for_tf('odom', 'rplidar_link', timeout_sec=3.0)
         # 發佈路徑
         self.DWA_path_publisher = self.create_publisher(MarkerArray, '/dwa_paths', 10)
         self.cmd_vel_publisher = self.create_publisher(Twist,'/cmd_vel',10)
-        self.cmd_vel_sub = self.create_subscription(
-            Twist,
-            '/cmd_vel',
-            self.cmd_vel_callback,
-            QoSProfile(reliability=ReliabilityPolicy.RELIABLE, depth=10)
-        )
+        if tf_ready:
+            self.cmd_vel_sub = self.create_subscription(
+                Twist,
+                '/cmd_vel',
+                self.cmd_vel_callback,
+                QoSProfile(reliability=ReliabilityPolicy.RELIABLE, depth=10)
+            )
+        else:
+            self.get_logger().error("TF not available. Node will not publish cmd_vel.")
+
         self.angle_subscriber = self.create_subscription(
             Marker,
             # '/robot_to_leg_vector',
@@ -45,7 +48,11 @@ class DWAPathPlanner(Node):
         # 訂閱雷射資料
         self.laser_subscriber = self.create_subscription(
             LaserScan, '/scan', self.laser_callback, 10)
-
+        self.leg_center_subscriber = self.create_subscription(
+            Marker,
+            '/leg_center',
+            self.leg_center_callback,
+            10)
         self.laser_data = None
         self.current_velocity = Twist()
         self.timer = self.create_timer(0.1, self.generate_paths)
@@ -55,31 +62,85 @@ class DWAPathPlanner(Node):
         self.best_path_points = None 
         self.best_path_index = -1
         self.best_path_velocity = None
-   
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+    def wait_for_tf(self, target_frame, source_frame, timeout_sec=3.0):
+        start_time = self.get_clock().now()
+        self.get_logger().info(f"Waiting for TF transform from [{source_frame}] to [{target_frame}]...")
+
+        while rclpy.ok():
+            try:
+                now = rclpy.time.Time(seconds=0)
+                self.tf_buffer.lookup_transform(
+                    target_frame,
+                    source_frame,
+                    now,
+                    timeout=rclpy.duration.Duration(seconds=0.2)
+                )
+                self.get_logger().info("TF transform is available. Proceeding...")
+                return True
+            except Exception as e:
+                current_time = self.get_clock().now()
+                elapsed = (current_time.nanoseconds - start_time.nanoseconds) / 1e9
+                if elapsed > timeout_sec:
+                    self.get_logger().warn(f"Timeout waiting for TF from [{source_frame}] to [{target_frame}]: {e}")
+                    return False
+                rclpy.spin_once(self, timeout_sec=0.1)
+    def leg_center_callback(self, msg):
+        if len(msg.points) == 0:
+            return
+
+        current_time = self.get_clock().now()
+        lidar_frame = 'rplidar_link'
+        target_frame = 'odom'  
+
+        # 轉換成 PointStamped 才能用 tf2 做座標轉換
+        raw_point = PointStamped()
+        raw_point.header.frame_id = lidar_frame
+        rclpy.time.Time(seconds=0).to_msg()
+        raw_point.point = msg.points[0]
+
+        try:
+            transformed_point = self.tf_buffer.transform(raw_point, target_frame, timeout=rclpy.duration.Duration(seconds=0.5))
+            current_pos = transformed_point.point
+            current_time_sec = current_time.nanoseconds / 1e9
+
+            if hasattr(self, 'last_leg_center') and hasattr(self, 'last_leg_time'):
+                dt = current_time_sec - self.last_leg_time
+                if dt > 0:
+                    dx = current_pos.x - self.last_leg_center.x
+                    dy = current_pos.y - self.last_leg_center.y
+                    distance = math.hypot(dx, dy)
+                    self.target_speed = distance / dt
+                    self.get_logger().info(f"[leg_center] Estimated target speed (world frame): {self.target_speed:.2f} m/s")
+
+            self.last_leg_center = current_pos
+            self.last_leg_time = current_time_sec
+
+        except Exception as e:
+            self.get_logger().warn(f"[leg_center] TF transform failed: {e}")
 
     def vector_arrows_callback(self, msg):
         if len(msg.points) > 1:
             self.target_point = msg.points[1]
-
-            # 拿到全局座標中的 x, y
             x = self.target_point.x
             y = self.target_point.y
 
             # 嘗試轉換為 rplidar_link 座標系
             local_coords = self.transform_to_local_frame(x, y)
-            
+
             if local_coords:
                 local_x, local_y = local_coords
                 self.target_point = Point()
                 self.target_point.x = local_x
                 self.target_point.y = local_y
-                self.target_point.z = 0.0  # 可選
-                
-                self.get_logger().info(f"Transformed point to rplidar_link frame: x={local_x:.2f}, y={local_y:.2f}")
+                self.target_point.z = 0.0
             else:
                 self.get_logger().warn("轉換失敗，local_coords 為 None")
         else:
             self.target_point = None
+
 
     def cmd_vel_callback(self, msg):
         # 更新當前速度
@@ -112,8 +173,8 @@ class DWAPathPlanner(Node):
 
             # 執行轉換
             transform = self.tf_buffer.lookup_transform(
-                self.robot_frame,     # 通常是 'rplidar_link'
-                self.global_frame,    # 通常是 'odom'
+                self.robot_frame,     #  'rplidar_link'
+                self.global_frame,    #  'odom'
                 rclpy.time.Time()
             )
 
@@ -126,7 +187,7 @@ class DWAPathPlanner(Node):
             self.get_logger().warning(f"無法轉換座標: {ex}")
             return None
 
-    def check_point_obstacle(self, point, safety_margin=0.2, angle_window=15):
+    def check_point_obstacle(self, point, safety_margin=0.25, angle_window=120):
         # 檢查指定點是否與障礙物相撞
         if self.laser_data is None or len(self.laser_data.ranges) == 0:
             return False
@@ -158,6 +219,7 @@ class DWAPathPlanner(Node):
     def calculate_obstacle_score(self, path_points):
         if not self.obstacle_points:
             return 1.0  
+        
             
         max_possible_distance = self.laser_data.range_max  
         
@@ -173,8 +235,16 @@ class DWAPathPlanner(Node):
 
     
     def calculate_velocity_score(self, v):
-        max_possible_speed = 1.0  
-        return v / max_possible_speed
+        target_speed = getattr(self, 'target_speed', 0.0)
+        max_possible_speed = 0.46  # 設最大速度為 1.0 m/s -> 0.46
+
+        # if max_possible_speed == 0:
+        #     return 0.0
+
+        score = 1.0 - abs(v - target_speed) / max_possible_speed
+        
+        return max(0.0, min(1.0, score))
+
     
     def select_best_path(self, paths):
         # 選擇最佳路徑
@@ -204,7 +274,7 @@ class DWAPathPlanner(Node):
                 best_path_index = idx
                 best_path_points = path_points
                 best_path_velocity = (v, w)
-        self.get_logger().info(f"Best Path {best_path_index} | Best Total Score: {max_score:.3f}")
+        # self.get_logger().info(f"Best Path {best_path_index} | Best Total Score: {max_score:.3f}")
 
         return best_path_index, best_path_points, best_path_velocity
 
@@ -214,12 +284,12 @@ class DWAPathPlanner(Node):
             self.get_logger().warn("NO LiDAR data")
             return
 
-        delta_v = 0.1
-        delta_w = 0.5
-        dt = 0.1
-        horizon = 20
+        delta_v = 0.15
+        delta_w = 0.35
+        dt = 0.15
+        horizon = 30
 
-        v_c = self.current_velocity.linear.x
+        v_c = self.current_velocity.linear.x /1.88
         w_c = self.current_velocity.angular.z
         # v_c = 0.5
         # w_c = 0.2
@@ -229,8 +299,10 @@ class DWAPathPlanner(Node):
         marker_array = MarkerArray()
         marker_id = 0
         paths = []
-
-        for v in np.arange(v_c - delta_v, v_c + delta_v , 0.05):
+        min_v = v_c-delta_v
+        # min_v = max(getattr(self, 'target_speed', 0.0), v_c - delta_v)
+        max_v = v_c + delta_v
+        for v in np.arange(min_v, max_v , 0.05):
             for w in np.arange(w_c - delta_w, w_c + delta_w , 0.1):
                 x, y, theta = 0.0, 0.0, 0.0
                 path_points = []
@@ -265,8 +337,8 @@ class DWAPathPlanner(Node):
 
         # 選擇最佳路徑
         self.best_path_index, self.best_path_points, self.best_path_velocity = self.select_best_path(paths)
-        if self.best_path_velocity is not None:
-            self.get_logger().info(f"Best Path Velocity: v = {self.best_path_velocity[0]:.3f}, w = {self.best_path_velocity[1]:.3f}")
+        # if self.best_path_velocity is not None:
+            # self.get_logger().info(f"Best Path Velocity: v = {self.best_path_velocity[0]:.3f}, w = {self.best_path_velocity[1]:.3f}")
             
         # 可視化路徑
         for idx, (path_points, obstacle_distance, v, w) in enumerate(paths):
@@ -303,28 +375,39 @@ class DWAPathPlanner(Node):
             delete_marker.action = Marker.DELETE
             marker_array.markers.append(delete_marker)
 
+
         # 發佈標記
         self.DWA_path_publisher.publish(marker_array)
         self.send_velcocity_cmd()
 
     def send_velcocity_cmd(self):
-        twist_msg= Twist()
-        # twist_msg.linear.x =   self.best_path_velocity[0]  # Set linear velocity
+        if self.best_path_velocity is None:
+            self.get_logger().warn("No valid path velocity. Skipping velocity command.")
+            return
+
+        twist_msg = Twist()
+        
         if self.target_point is not None:
-            if self.best_path_velocity[0] < 0.15:
-                twist_msg.linear.x =   self.best_path_velocity[0]
-                twist_msg.angular.z =  0.0
-                # twist_msg.angular.z =  0.0 # Set angular velocity left is + right is -        
+            distance = math.hypot(self.target_point.x , self.target_point.y)  
+
+            if distance > 0.20:
+                twist_msg.linear.x = self.best_path_velocity[0] *1.88
+                twist_msg.angular.z = self.best_path_velocity[1]
             else:
-                twist_msg.linear.x =   self.best_path_velocity[0]
-                twist_msg.angular.z =  self.best_path_velocity[1] # Set angular velocity left is + right is -
-            # twist_msg.angular.z =  self.best_path_velocity[1]
-            print(twist_msg.linear.x)
-            print(twist_msg.angular.z)
-            # Publish Twist message
+                twist_msg.linear.x = 0.0
+                twist_msg.angular.z = 0.0  
+
+            if twist_msg.linear.x > 0.46:
+                twist_msg.linear.x = 0.46
+
+            # print(twist_msg.linear.x)
+            # print(twist_msg.angular.z)
+
             self.cmd_vel_publisher.publish(twist_msg)
         else:
-           print("self.target_point is None, skipping velocity calculation.")  
+            print("self.target_point is None, skipping velocity calculation.")
+
+ 
 
 def main(args=None):
     rclpy.init(args=args)
