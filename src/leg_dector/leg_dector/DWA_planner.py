@@ -113,7 +113,7 @@ class DWAPathPlanner(Node):
                     dy = current_pos.y - self.last_leg_center.y
                     distance = math.hypot(dx, dy)
                     self.target_speed = distance / dt
-                    self.get_logger().info(f"[leg_center] Estimated target speed (world frame): {self.target_speed:.2f} m/s")
+                    # self.get_logger().info(f"[leg_center] Estimated target speed (world frame): {self.target_speed:.2f} m/s")
 
             self.last_leg_center = current_pos
             self.last_leg_time = current_time_sec
@@ -265,16 +265,16 @@ class DWAPathPlanner(Node):
                 self.velocity_weight * velocity_score
             )
             # print each score of DWA score
-            # self.get_logger().info(
-            #     f"Path {idx} | Goal: {goal_score:.3f}, Obstacle: {obstacle_score:.3f}, "
-            #     f"Velocity: {velocity_score:.3f}, Total: {total_score:.3f}"
-            # )
+            self.get_logger().info(
+                f"Path {idx} | Goal: {goal_score:.3f}, Obstacle: {obstacle_score:.3f}, "
+                f"Velocity: {velocity_score:.3f}, Total: {total_score:.3f}"
+            )
             if total_score > max_score:
                 max_score = total_score
                 best_path_index = idx
                 best_path_points = path_points
                 best_path_velocity = (v, w)
-        # self.get_logger().info(f"Best Path {best_path_index} | Best Total Score: {max_score:.3f}")
+        self.get_logger().info(f"Best Path {best_path_index} | Best Total Score: {max_score:.3f}")
 
         return best_path_index, best_path_points, best_path_velocity
 
