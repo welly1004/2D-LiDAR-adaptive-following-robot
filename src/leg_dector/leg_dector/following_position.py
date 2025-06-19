@@ -27,7 +27,7 @@ class FollowingPositionNode(Node):
 
         self.long_axis_arrow_pub = self.create_publisher(Marker, 'long_axis_vector', 10)
         self.best_point_vector_pub = self.create_publisher(Marker, 'best_point_vector', 10)
-
+        self.next_leg_pub = self.create_publisher(Marker, 'next_leg_marker', 10)
         
         # 初始化TF2緩衝區和監聽器
         self.tf_buffer = tf2_ros.Buffer()
@@ -39,14 +39,12 @@ class FollowingPositionNode(Node):
         self.global_leg_positions = deque(maxlen=5)  # 全局座標下的腿部位置
         self.current_theta = 0.0
         self.global_theta = 0.0  # 全局座標系中的方向角
-        self.movement_threshold = 0.25
+        self.movement_threshold = 0.30
 
-        
-
-        self.alpha = 0.03 #robot to following position
-        self.beta =  0.37 #obstacle to following position
-        self.gamma = 0.60 #leg to following position
-        self.max_obs_dist = 0.3
+        self.alpha = 0.1 #robot to following position 0.15
+        self.beta =  0.48 #obstacle to following position
+        self.gamma = 0.42 #leg to following position 0.37
+        self.max_obs_dist = 0.35
         
         self.robot_pos = (0.0, 0.0)
         self.obstacles = []
@@ -60,6 +58,12 @@ class FollowingPositionNode(Node):
         # 顯示總分或分項分數
         self.show_detailed_scores = False
         self.last_marker_count = 0
+
+        self.prev_leg_time = None
+        self.prev_leg_pos = None
+
+        # 記錄下一個橢圓中心點的全局座標
+        self.next_leg_global = None
     def transform_to_global_frame(self, x, y):
         """將相對座標轉換為odom坐標系下的坐標"""
         try:
@@ -116,6 +120,7 @@ class FollowingPositionNode(Node):
         
         # --- 機器人分數（離機器人越近分數越高）---
         d_robot = math.sqrt((x - self.robot_pos[0])**2 + (y - self.robot_pos[1])**2)
+        d_robot = abs(d_robot)
         # 將距離轉換為 0-1 範圍的分數，越近分數越高
         max_robot_dist = 2.0  # 設定一個最大距離閾值
         # robot_score = max(0, 1.0 - d_robot / max_robot_dist)
@@ -124,7 +129,7 @@ class FollowingPositionNode(Node):
         
         # --- 障礙物分數（離障礙物越遠分數越高）---
         if not self.obstacles:
-            obstacle_score = self.beta  # 如果沒有障礙物，給予最高分
+            obstacle_score = 1.0 # 如果沒有障礙物，給予最高分
         else:
             
             # 將障礙物資料轉換為 NumPy 陣列
@@ -135,18 +140,29 @@ class FollowingPositionNode(Node):
 
             # 取得最小距離
             min_obstacle_dist = np.min(dists)
+            min_obstacle_dist = abs(min_obstacle_dist)
 
             # 將距離轉換為 0-1 範圍的分數，越遠分數越高
             obstacle_score = min(1.0, min_obstacle_dist / self.max_obs_dist)
+            obstacle_score = self.beta * obstacle_score
         
         # --- 腳分數（離腳越近分數越高）---
-        if self.leg_positions:
-            leg_x, leg_y = self.leg_positions[-1]
-            d_leg = math.sqrt((x - leg_x)**2 + (y - leg_y)**2)
-            # 將距離轉換為 0-1 範圍的分數，越近分數越高
-            max_leg_dist = 0.9  # 設定一個最大距離閾值 1.5->0.9
-            leg_score = max(0, 1.0 - d_leg / max_leg_dist)
-            leg_score = self.gamma * leg_score  # 應用權重
+        if self.next_leg_global:
+            # 將 next_leg_global (odom) 轉到 robot frame
+            local_next_leg = self.transform_from_global_to_robot_frame(
+                self.next_leg_global[0], self.next_leg_global[1])
+            
+            if local_next_leg:
+                leg_x, leg_y = local_next_leg
+                d_leg = math.sqrt((x - leg_x)**2 + (y - leg_y)**2)
+                d_leg = abs(d_leg)
+                # print(d_leg)
+                # max_leg_dist = 0.85
+                leg_score = max((0.8 - d_leg )/ 0.3,0)
+                # print(leg_score)
+                leg_score = self.gamma * leg_score
+            else:
+                leg_score = 0.0
         else:
             leg_score = 0.0
         
@@ -178,7 +194,7 @@ class FollowingPositionNode(Node):
             while robot_relative_theta < -math.pi:
                 robot_relative_theta += 2 * math.pi
                 
-            self.get_logger().info(f"機器人座標系下的移動方向: {robot_relative_theta:.2f} 弧度")
+            # self.get_logger().info(f"機器人座標系下的移動方向: {robot_relative_theta:.2f} 弧度")
             return robot_relative_theta
             
         except TransformException as ex:
@@ -429,7 +445,7 @@ class FollowingPositionNode(Node):
         
         # 如果距離小於閾值，認為沒有實質性移動
         if distance < self.movement_threshold:
-            self.get_logger().info(f"移動距離 {distance:.2f} 小於閾值 {self.movement_threshold}，不更新方向")
+            # self.get_logger().info(f"移動距離 {distance:.2f} 小於閾值 {self.movement_threshold}，不更新方向")
             return None
         
         # 計算odom座標系中的移動向量和方向
@@ -437,30 +453,84 @@ class FollowingPositionNode(Node):
         
         # 計算odom座標系中的方向
         global_theta = math.atan2(vy, vx)
-        self.get_logger().info(f"odom座標系下的移動方向: {global_theta:.2f} 弧度")
+        # self.get_logger().info(f"odom座標系下的移動方向: {global_theta:.2f} 弧度")
         
         # 返回全局方向，不轉換到機器人座標系
         return global_theta
-
     def leg_center_callback(self, msg):
-        if msg.points:
-            # 保存機器人相對座標系下的腿部位置
-            local_leg_pos = (msg.points[0].x, msg.points[0].y)
-            self.leg_positions.append(local_leg_pos)
+        if not msg.points:
+            return
+
+        local_leg_pos = (msg.points[0].x, msg.points[0].y)
+        self.leg_positions.append(local_leg_pos)
+
+        global_leg_pos = self.transform_to_global_frame(local_leg_pos[0], local_leg_pos[1])
+        if global_leg_pos is None:
+            return
+
+        self.global_leg_positions.append(global_leg_pos)
+
+        now = self.get_clock().now()
+        prediction_dt = 0.45 # 預測未來 1 秒
+
+        if self.prev_leg_time and self.prev_leg_pos:
+            dt = (now - self.prev_leg_time).nanoseconds / 1e9
+            if dt > 0:
+                dx = global_leg_pos[0] - self.prev_leg_pos[0]
+                dy = global_leg_pos[1] - self.prev_leg_pos[1]
+                vx = dx / dt
+                vy = dy / dt
+                speed = math.hypot(vx, vy)
+                distance = math.hypot(dx, dy)
+
+                if distance < 0.05 or speed < 0.05:
+                    next_leg_x, next_leg_y = global_leg_pos
+                else:
+                    next_leg_x = global_leg_pos[0] + vx * prediction_dt
+                    next_leg_y = global_leg_pos[1] + vy * prediction_dt
+            else:
+                next_leg_x, next_leg_y = global_leg_pos
+        else:
+            next_leg_x, next_leg_y = global_leg_pos
+
+        # 更新記錄
+        self.prev_leg_time = now
+        self.prev_leg_pos = global_leg_pos
+
+        # 儲存與發佈
+        self.next_leg_global = (next_leg_x, next_leg_y)
+        self.publish_next_leg_marker(next_leg_x, next_leg_y)
+
+        # 計算方向角
+        new_global_theta = self.calculate_movement_direction()
+        if new_global_theta is not None:
+            self.global_theta = new_global_theta
+
+        # 發佈橢圓
+        next_leg_local = self.transform_from_global_to_robot_frame(next_leg_x, next_leg_y)
+        if next_leg_local:
+            self.publish_ellipse(next_leg_local[0], next_leg_local[1], self.global_theta)
+
+
+    # def leg_center_callback(self, msg):
+    #     if msg.points:
+    #         # 保存機器人相對座標系下的腿部位置
+    #         local_leg_pos = (msg.points[0].x, msg.points[0].y)
+    #         self.leg_positions.append(local_leg_pos)
             
-            # 轉換為odom座標系並保存
-            global_leg_pos = self.transform_to_global_frame(local_leg_pos[0], local_leg_pos[1])
-            if global_leg_pos is not None:
-                self.global_leg_positions.append(global_leg_pos)
+    #         # 轉換為odom座標系並保存
+    #         global_leg_pos = self.transform_to_global_frame(local_leg_pos[0], local_leg_pos[1])
+    #         if global_leg_pos is not None:
+    #             self.global_leg_positions.append(global_leg_pos)
                 
-                # 計算全局座標系中的移動方向
-                new_global_theta = self.calculate_movement_direction()
-                if new_global_theta is not None:
-                    self.global_theta = new_global_theta  # 存儲全局方向
-                    self.get_logger().info(f"更新全局移動方向: {self.global_theta:.2f} 弧度")
+    #             # 計算全局座標系中的移動方向
+    #             new_global_theta = self.calculate_movement_direction()
+    #             if new_global_theta is not None:
+    #                 self.global_theta = new_global_theta  # 存儲全局方向
+    #                 self.get_logger().info(f"更新全局移動方向: {self.global_theta:.2f} 弧度")
                 
-                # 使用原始相對座標和全局方向發布可視化標記
-                self.publish_ellipse(local_leg_pos[0], local_leg_pos[1], self.global_theta)
+    #             # 使用原始相對座標和全局方向發布可視化標記
+    #             self.publish_ellipse(local_leg_pos[0], local_leg_pos[1], self.global_theta)
     def publish_long_axis_vector(self, center, theta):
         # 粉紅色箭頭，圓心指向橢圓長軸方向
         marker = Marker()
@@ -529,7 +599,30 @@ class FollowingPositionNode(Node):
         marker.color.a = 1.0
 
         self.best_point_vector_pub.publish(marker)
+    
+    def publish_next_leg_marker(self, x, y):
+        marker = Marker()
+        marker.header.frame_id = self.global_frame
+        marker.header.stamp = rclpy.time.Time().to_msg()
+        marker.id = 999
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
 
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.1
+        marker.pose.orientation.w = 1.0
+
+        marker.scale.x = 0.08
+        marker.scale.y = 0.08
+        marker.scale.z = 0.08
+
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+
+        self.next_leg_pub.publish(marker)
 def main(args=None):
     rclpy.init(args=args)
     node = FollowingPositionNode()
