@@ -181,12 +181,17 @@ class DistancePlotter(Node):
             cross = self.best_vector[0] * self.long_axis_vector[1] - self.best_vector[1] * self.long_axis_vector[0]
             mag1 = math.sqrt(self.best_vector[0]**2 + self.best_vector[1]**2)
             mag2 = math.sqrt(self.long_axis_vector[0]**2 + self.long_axis_vector[1]**2)
-
+            
             if mag1 > 0 and mag2 > 0:
                 cos_angle = max(min(dot / (mag1 * mag2), 1.0), -1.0)
                 angle = math.degrees(math.acos(cos_angle))
                 if cross < 0:
-                    angle *= -1  # 在右邊，設為負角度
+                    angle *= -1
+                
+                # 修正角度 - 調整180度
+                angle = angle - 180 if angle > 0 else angle + 180
+                angle = -angle
+
                 self.dynamic_target_angle = round(angle, 2)
 
         # 儲存時間對應的動態目標值
