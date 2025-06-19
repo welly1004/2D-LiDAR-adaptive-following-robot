@@ -21,6 +21,8 @@ from std_msgs.msg import Bool
 from geometry_msgs.msg import Point, Quaternion
 
 import math
+import time
+
 
 
 
@@ -116,7 +118,10 @@ class LegDetectionNode(Node):
         # plt.ylabel('Distance (m)')
         # plt.title('Real-time Distance to Leg')
         # plt.ion()  # Enable interactive mode
- 
+        self.last_target_position = None
+        self.last_stable_time = time.time()
+        self.position_tolerance = 0.05  # 小於這個值就當作沒動
+        self.stability_duration = 200.0   # 5 秒沒動就 shutdown
     
         self.start_pose_published = False
     def odom_callback(self, msg):
@@ -211,19 +216,49 @@ class LegDetectionNode(Node):
                 cluster_markers = self.create_cluster_markers(msg.header.frame_id, cluster_points, cluster_labels)
                 for marker in cluster_markers:
                     self.cluster_marker_publisher.publish(marker)
+            self.check_target_movement()
 
-            distance_to_target = self.calculate_distance([0, 0], self.target_position)
-            if distance_to_target < self.shutdown_distance_threshold:
-                self.get_logger().warn('Distance to target is less than 20cm.')
-                # self.publish_start_end()  # Publish START and END
-                self.clear_all_markers(msg.header.frame_id)
-                temp = Bool()
-                temp.data = True
-                # self.start_position_publisher.publish(self.current_robot_pose)
-                self.go_back_publisher.publish(temp)
-                # rclpy.shutdown()  
-                return
+            # if distance_to_target < self.shutdown_distance_threshold:
+            #     self.get_logger().warn('Distance to target is less than 20cm.')
+            #     # self.publish_start_end()  # Publish START and END
+            #     self.clear_all_markers(msg.header.frame_id)
+            #     temp = Bool()
+            #     temp.data = True
+            #     # self.start_position_publisher.publish(self.current_robot_pose)
+            #     self.go_back_publisher.publish(temp)
+            #     # rclpy.shutdown()  
+            #     return
+    def is_stationary(self, current_position, last_position):
+        dx = current_position[0] - last_position[0]
+        dy = current_position[1] - last_position[1]
+        distance = math.hypot(dx, dy)
+        return distance < self.position_tolerance
 
+    def check_target_movement(self):
+        now = time.time()
+        current_position = self.target_position[:2]  # 只考慮 x, y
+
+        if self.last_target_position is None:
+            self.last_target_position = current_position
+            self.last_stable_time = now
+            return
+
+        if self.is_stationary(current_position, self.last_target_position):
+            if now - self.last_stable_time > self.stability_duration:
+                self.get_logger().warn('Target position has not moved significantly for 10 seconds. Shutting down.')
+                self.shutdown_procedure()
+        else:
+            # 位置有變動，更新記錄
+            self.last_stable_time = now
+            self.last_target_position = current_position
+
+    def shutdown_procedure(self):
+        frame_id = getattr(self, "latest_frame_id", "base_link")  # fallback 預設為 base_link
+        self.clear_all_markers(frame_id)
+        temp = Bool()
+        temp.data = True
+        self.go_back_publisher.publish(temp)
+        rclpy.shutdown()
     def detect_leg_points(self, scan_msg):
         ranges = np.array(scan_msg.ranges)
         angles = np.linspace(scan_msg.angle_min, scan_msg.angle_max, len(ranges))
@@ -256,7 +291,7 @@ class LegDetectionNode(Node):
         
         if self.target_detected and clustering_successful:
             # target_index = self.find_nearest_point_index(points, self.target_position)
-            valid_mask = np.linalg.norm(self.points - self.target_position,axis=1) < 0.15
+            valid_mask = np.linalg.norm(self.points - self.target_position,axis=1) < 0.30
             if np.sum(valid_mask)!=0:
                 self.points = self.points[valid_mask]
                 # clustering = DBSCAN(eps=0.1, min_samples=3).fit(self.points)  
@@ -274,7 +309,7 @@ class LegDetectionNode(Node):
                     pca = PCA(n_components=1)
                     pca.fit(cluster)
                     variance_ratio = pca.explained_variance_ratio_[0]
-                    if variance_ratio < 0.95:
+                    if 0.89 < variance_ratio < 0.91:
                         cluster_mean = np.mean(cluster, axis=0)
                         leg_points.append(cluster_mean)
                         if not self.target_detected:
@@ -292,7 +327,7 @@ class LegDetectionNode(Node):
         # xs = ranges * np.cos(angles)
         # ys = ranges * np.sin(angles)
         # points = np.column_stack((xs, ys))
-        target_mask = np.linalg.norm(self.points - self.target_position, axis=1) < 0.15 
+        target_mask = np.linalg.norm(self.points - self.target_position, axis=1) < 0.30
         cluster_points = self.points[target_mask]
         if len(cluster_points) > 0:
             clustering = DBSCAN(eps=0.3, min_samples=3).fit(cluster_points)
