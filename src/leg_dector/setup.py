@@ -21,8 +21,10 @@ setup(
     entry_points={
         'console_scripts':[
             'leg_detection = leg_dector.leg_detection:main',
-            'human_following = leg_dector.human_following:main',
-            'go_back = leg_dector.go_back:main'
+            'following_position = leg_dector.following_position:main',
+            'go_back = leg_dector.go_back:main',
+            'DWA_planner = leg_dector.DWA_planner:main',
+            'data = leg_dector.data:main'
         ],
     },
 )
