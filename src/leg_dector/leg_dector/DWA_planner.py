@@ -390,7 +390,7 @@ class DWAPathPlanner(Node):
         if self.target_point is not None:
             distance = math.hypot(self.target_point.x , self.target_point.y)  
 
-            if distance > 0.20:
+            if distance > 0.18:
                 twist_msg.linear.x = self.best_path_velocity[0] *1.88
                 twist_msg.angular.z = self.best_path_velocity[1]
             else:
