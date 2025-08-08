@@ -291,7 +291,7 @@ class LegDetectionNode(Node):
         
         if self.target_detected and clustering_successful:
             # target_index = self.find_nearest_point_index(points, self.target_position)
-            valid_mask = np.linalg.norm(self.points - self.target_position,axis=1) < 0.30
+            valid_mask = np.linalg.norm(self.points - self.target_position,axis=1) < 0.15
             if np.sum(valid_mask)!=0:
                 self.points = self.points[valid_mask]
                 # clustering = DBSCAN(eps=0.1, min_samples=3).fit(self.points)  
@@ -327,7 +327,7 @@ class LegDetectionNode(Node):
         # xs = ranges * np.cos(angles)
         # ys = ranges * np.sin(angles)
         # points = np.column_stack((xs, ys))
-        target_mask = np.linalg.norm(self.points - self.target_position, axis=1) < 0.30
+        target_mask = np.linalg.norm(self.points - self.target_position, axis=1) < 0.15
         cluster_points = self.points[target_mask]
         if len(cluster_points) > 0:
             clustering = DBSCAN(eps=0.3, min_samples=3).fit(cluster_points)
