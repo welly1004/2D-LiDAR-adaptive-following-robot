@@ -41,9 +41,9 @@ class FollowingPositionNode(Node):
         self.global_theta = 0.0  # 全局座標系中的方向角
         self.movement_threshold = 0.30
 
-        self.alpha = 0.1 #robot to following position 0.15
+        self.alpha = 0.45 #robot to following position 0.15
         self.beta =  0.48 #obstacle to following position
-        self.gamma = 0.42 #leg to following position 0.37
+        self.gamma = 0.22 #leg to following position 0.37
         self.max_obs_dist = 0.35
         
         self.robot_pos = (0.0, 0.0)
@@ -534,7 +534,7 @@ class FollowingPositionNode(Node):
     def publish_long_axis_vector(self, center, theta):
         # 粉紅色箭頭，圓心指向橢圓長軸方向
         marker = Marker()
-        marker.header.frame_id = self.global_frame
+        marker.header.frame_id = 'base_link'
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "long_axis_vector"
         marker.id = 0
@@ -570,7 +570,7 @@ class FollowingPositionNode(Node):
     def publish_best_point_vector(self, center, best_point):
         # 紫色箭頭，圓心指向最佳點
         marker = Marker()
-        marker.header.frame_id = self.global_frame
+        marker.header.frame_id = 'base_link'
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "best_point_vector"
         marker.id = 0
