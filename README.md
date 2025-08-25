@@ -6,7 +6,7 @@
 
 ---
 
-## 硬體需求
+## 硬體配置
 
 - TurtleBot4 Lite  
 - RPLIDAR A1  
