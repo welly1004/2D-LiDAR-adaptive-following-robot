@@ -1,7 +1,7 @@
 # LiDAR Human Following Robot in ROS2
 
 本專案基於 **ROS2 Galactic**，整合 **RPLIDAR A1 光達** 與 **TurtleBot4 Lite**，實現自適應跟隨機器人。  
-系統包含 **人腿偵測、最佳跟隨位置評估、局部規劃 (DWA)、復位全域規劃 (QRRT star)、跟隨數據統計 五大模組，並透過 **RViz2** 進行可視化。
+系統包含 **人腿偵測、最佳跟隨位置評估、局部規劃 (DWA)、復位全域規劃 (QRRT star)、跟隨數據統計 五大功能，並透過 **RViz2** 進行可視化。
 <img width="1514" height="825" alt="image" src="https://github.com/user-attachments/assets/e74ebd31-b39c-417a-9b0f-b20efa379376" />
 
 ---
